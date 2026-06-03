@@ -26,7 +26,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 KINOPOISK_API_KEY = os.environ.get("KINOPOISK_API_KEY")
 
-# Если потом подключишь Persistent Disk на Render, поставь DATA_DIR=/var/data
+# Если подключишь Persistent Disk на Render, поставь DATA_DIR=/var/data
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -72,14 +72,15 @@ memory = load_json(MEMORY_FILE, {})
 state = load_json(STATE_FILE, {
     "seen_movies": {},
     "user_profile": {},
-    "callback_movies": {}
+    "callback_movies": {},
+    "poster_cache": {}
 })
 ratings = load_json(RATINGS_FILE, {})
 
 state.setdefault("seen_movies", {})
 state.setdefault("user_profile", {})
 state.setdefault("callback_movies", {})
-
+state.setdefault("poster_cache", {})
 
 # =========================
 # SAVE
@@ -102,7 +103,6 @@ def save_ratings():
 # =========================
 
 def send_long_message(chat_id, text, reply_markup=None):
-    """Telegram режет сообщения длиннее 4096 символов."""
     max_len = 3900
     text = str(text)
 
@@ -125,13 +125,19 @@ def send_long_message(chat_id, text, reply_markup=None):
         parts.append(current.strip())
 
     for i, part in enumerate(parts):
-        bot.send_message(chat_id, part, reply_markup=reply_markup if i == len(parts) - 1 else None)
+        bot.send_message(
+            chat_id,
+            part,
+            reply_markup=reply_markup if i == len(parts) - 1 else None
+        )
 
 
 def get_seen(user_id):
     state["seen_movies"].setdefault(user_id, [])
+
     if isinstance(state["seen_movies"][user_id], set):
         state["seen_movies"][user_id] = list(state["seen_movies"][user_id])
+
     return state["seen_movies"][user_id]
 
 
@@ -140,17 +146,22 @@ def get_profile(user_id):
         "likes": [],
         "dislikes": []
     })
+
     state["user_profile"][user_id].setdefault("likes", [])
     state["user_profile"][user_id].setdefault("dislikes", [])
+
     return state["user_profile"][user_id]
 
 
 def add_unique(items, value, limit=100):
     value = str(value).strip()
+
     if not value:
         return items
+
     if value in items:
         items.remove(value)
+
     items.append(value)
     return items[-limit:]
 
@@ -158,6 +169,7 @@ def add_unique(items, value, limit=100):
 def remove_if_exists(items, value):
     if value in items:
         items.remove(value)
+
     return items
 
 
@@ -167,8 +179,8 @@ def add_seen(user_id, movie_name):
 
 
 def extract_movie_name(block):
-    """Достаём название из блока ответа AI."""
     lines = [line.strip() for line in block.strip().splitlines() if line.strip()]
+
     if not lines:
         return "Фильм"
 
@@ -176,6 +188,7 @@ def extract_movie_name(block):
     first = re.sub(r"^\d+[\).\-\s]+", "", first)
     first = first.replace("🎬", "").strip()
     first = re.sub(r"^Название:\s*", "", first, flags=re.IGNORECASE).strip()
+
     return first[:90] or "Фильм"
 
 
@@ -190,12 +203,22 @@ def normalize_movie_key(movie_name):
     return text[:120]
 
 
+def clean_title_for_search(movie_name):
+    title = str(movie_name)
+    title = title.replace("🎬", "").strip()
+    title = re.sub(r"\(\d{4}\)", "", title).strip()
+    title = re.sub(r"^\d+[\).\-\s]+", "", title).strip()
+    title = re.sub(r"\s+", " ", title).strip()
+
+    return title
+
+
 def make_callback_key(movie_name):
     raw = f"{movie_name}:{time.time()}"
     key = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
     state["callback_movies"][key] = movie_name
 
-    # Чтобы файл state.json не разрастался бесконечно
     if len(state["callback_movies"]) > 3000:
         last_items = list(state["callback_movies"].items())[-2000:]
         state["callback_movies"] = dict(last_items)
@@ -208,26 +231,116 @@ def get_movie_by_callback_key(key):
 
 
 # =========================
+# POSTERS
+# =========================
+
+def find_kinopoisk_poster(movie_name):
+    """
+    Ищет постер по названию фильма через Kinopoisk API.
+    Для AI-подборок это нужно, потому что OpenAI даёт название,
+    а постер надо отдельно найти в базе Кинопоиска.
+    """
+    if not KINOPOISK_API_KEY:
+        return None
+
+    search_title = clean_title_for_search(movie_name)
+
+    if not search_title:
+        return None
+
+    cache_key = normalize_movie_key(search_title)
+
+    cached = state.get("poster_cache", {}).get(cache_key)
+    if cached:
+        return cached
+
+    url = "https://kinopoiskapiunofficial.tech/api/v2.1/films/search-by-keyword"
+
+    headers = {
+        "X-API-KEY": KINOPOISK_API_KEY,
+        "Content-Type": "application/json"
+    }
+
+    params = {
+        "keyword": search_title,
+        "page": 1
+    }
+
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+    except Exception:
+        logging.exception("Ошибка поиска постера в Kinopoisk API")
+        return None
+
+    films = data.get("films", [])
+
+    if not films:
+        return None
+
+    film = films[0]
+    poster_url = film.get("posterUrlPreview") or film.get("posterUrl")
+
+    if poster_url:
+        state["poster_cache"][cache_key] = poster_url
+        save_state()
+
+    return poster_url
+
+
+def send_movie_card(chat_id, text, movie_name, poster_url=None):
+    """
+    Отправляет карточку фильма.
+    Если есть постер — отправляет фото.
+    Если фото не отправилось — падает обратно на обычный текст.
+    """
+    markup = movie_markup(movie_name)
+
+    if poster_url:
+        try:
+            # У Telegram подпись к фото ограничена, поэтому длинный текст шлём отдельно.
+            if len(text) <= 950:
+                bot.send_photo(
+                    chat_id,
+                    poster_url,
+                    caption=text,
+                    reply_markup=markup
+                )
+            else:
+                bot.send_photo(chat_id, poster_url)
+                bot.send_message(chat_id, text, reply_markup=markup)
+
+            return
+        except Exception:
+            logging.exception("Не удалось отправить постер")
+
+    bot.send_message(chat_id, text, reply_markup=markup)
+
+
+# =========================
 # RATINGS
 # =========================
 
 def get_rating_record(movie_name):
     movie_key = normalize_movie_key(movie_name)
+
     ratings.setdefault(movie_key, {
         "title": movie_name,
         "likes": 0,
         "dislikes": 0,
         "users": {}
     })
+
     ratings[movie_key].setdefault("title", movie_name)
     ratings[movie_key].setdefault("likes", 0)
     ratings[movie_key].setdefault("dislikes", 0)
     ratings[movie_key].setdefault("users", {})
+
     return movie_key, ratings[movie_key]
 
 
 def vote_movie(user_id, movie_name, vote):
-    """vote: like или dislike. Один пользователь = один активный голос за фильм."""
     movie_key, record = get_rating_record(movie_name)
     users = record["users"]
     old_vote = users.get(user_id)
@@ -252,6 +365,7 @@ def vote_movie(user_id, movie_name, vote):
     ratings[movie_key] = record
 
     profile = get_profile(user_id)
+
     if vote == "like":
         profile["likes"] = add_unique(profile["likes"], movie_name, limit=100)
         profile["dislikes"] = remove_if_exists(profile["dislikes"], movie_name)
@@ -261,6 +375,7 @@ def vote_movie(user_id, movie_name, vote):
 
     save_ratings()
     save_state()
+
     return record, "changed"
 
 
@@ -268,6 +383,7 @@ def format_rating_line(movie_name):
     _, record = get_rating_record(movie_name)
     likes = record.get("likes", 0)
     dislikes = record.get("dislikes", 0)
+
     return f"👍 {likes}   👎 {dislikes}"
 
 
@@ -276,15 +392,18 @@ def get_user_top_movies(limit=10):
         return "🏆 Топ пользователей пока пуст. Поставь лайки фильмам, и рейтинг начнёт собираться."
 
     items = []
+
     for record in ratings.values():
         likes = int(record.get("likes", 0))
         dislikes = int(record.get("dislikes", 0))
         total = likes + dislikes
+
         if total == 0:
             continue
 
         score = likes - dislikes
         approval = round((likes / total) * 100)
+
         items.append({
             "title": record.get("title", "Фильм"),
             "likes": likes,
@@ -297,9 +416,13 @@ def get_user_top_movies(limit=10):
     if not items:
         return "🏆 Топ пользователей пока пуст. Поставь лайки фильмам, и рейтинг начнёт собираться."
 
-    items.sort(key=lambda x: (x["score"], x["likes"], -x["dislikes"], x["approval"]), reverse=True)
+    items.sort(
+        key=lambda x: (x["score"], x["likes"], -x["dislikes"], x["approval"]),
+        reverse=True
+    )
 
     text = "🏆 Топ фильмов по оценкам пользователей\n\n"
+
     for i, item in enumerate(items[:limit], start=1):
         text += (
             f"{i}. 🎬 {item['title']}\n"
@@ -315,6 +438,7 @@ def get_user_top_movies(limit=10):
 
 def menu_markup():
     markup = InlineKeyboardMarkup(row_width=2)
+
     markup.add(
         InlineKeyboardButton("🎬 Фильмы", callback_data="menu_movies"),
         InlineKeyboardButton("📺 Сериалы", callback_data="menu_series"),
@@ -325,11 +449,13 @@ def menu_markup():
         InlineKeyboardButton("🧠 Мой вкус", callback_data="menu_profile"),
         InlineKeyboardButton("♻️ Сбросить повторы", callback_data="menu_reset")
     )
+
     return markup
 
 
 def genres_markup():
     markup = InlineKeyboardMarkup(row_width=2)
+
     genres = [
         ("😂 Комедия", "комедия"),
         ("🧠 Триллер", "триллер"),
@@ -349,19 +475,24 @@ def genres_markup():
         markup.add(InlineKeyboardButton(title, callback_data=f"genre:{genre}"))
 
     markup.add(InlineKeyboardButton("⬅️ Назад", callback_data="menu_back"))
+
     return markup
 
 
 def movie_markup(movie_name):
     key = make_callback_key(movie_name)
+
     markup = InlineKeyboardMarkup(row_width=2)
+
     markup.add(
         InlineKeyboardButton("🎞 Похожие", callback_data=f"sim:{key}")
     )
+
     markup.add(
         InlineKeyboardButton("👍 Лайк", callback_data=f"like:{key}"),
         InlineKeyboardButton("👎 Дизлайк", callback_data=f"dislike:{key}")
     )
+
     return markup
 
 
@@ -443,7 +574,6 @@ def build_prompt(user_id, user_text, mode="search"):
 def split_recommendation_blocks(answer):
     blocks = [b.strip() for b in answer.split("\n\n") if b.strip()]
 
-    # Если AI вдруг не разделил пустыми строками, пробуем разделить по 🎬
     if len(blocks) <= 1 and "🎬" in answer:
         raw = re.split(r"(?=🎬)", answer)
         blocks = [b.strip() for b in raw if b.strip()]
@@ -473,7 +603,10 @@ def send_recommendations(chat_id, user_id, user_text, mode="search"):
         add_seen(user_id, movie_name)
 
         block_with_rating = f"{block}\n\n{format_rating_line(movie_name)}"
-        bot.send_message(chat_id, block_with_rating, reply_markup=movie_markup(movie_name))
+
+        poster_url = find_kinopoisk_poster(movie_name)
+        send_movie_card(chat_id, block_with_rating, movie_name, poster_url)
+
         sent_any = True
 
     if not sent_any:
@@ -493,6 +626,7 @@ KP_CACHE = {
     "page": None,
     "films": []
 }
+
 KP_CACHE_TTL_SECONDS = 60 * 60 * 6
 
 
@@ -501,14 +635,21 @@ def get_kinopoisk_top_films(page=1, limit=10):
         return None, "Не найден KINOPOISK_API_KEY. Добавь его в Render → Environment."
 
     now = time.time()
-    if KP_CACHE["page"] == page and KP_CACHE["films"] and now - KP_CACHE["time"] < KP_CACHE_TTL_SECONDS:
+
+    if (
+        KP_CACHE["page"] == page
+        and KP_CACHE["films"]
+        and now - KP_CACHE["time"] < KP_CACHE_TTL_SECONDS
+    ):
         return KP_CACHE["films"][:limit], None
 
     url = "https://kinopoiskapiunofficial.tech/api/v2.2/films/top"
+
     headers = {
         "X-API-KEY": KINOPOISK_API_KEY,
         "Content-Type": "application/json"
     }
+
     params = {
         "type": "TOP_250_BEST_FILMS",
         "page": page
@@ -573,7 +714,11 @@ def send_kinopoisk_top(chat_id, page=1, limit=10):
 
     for i, film in enumerate(films, start=1):
         movie_name, text = format_kinopoisk_film(film, index=i)
-        bot.send_message(chat_id, f"{text}\n\n{format_rating_line(movie_name)}", reply_markup=movie_markup(movie_name))
+
+        poster_url = film.get("posterUrlPreview") or film.get("posterUrl")
+        full_text = f"{text}\n\n{format_rating_line(movie_name)}"
+
+        send_movie_card(chat_id, full_text, movie_name, poster_url)
 
     save_state()
     save_ratings()
@@ -600,7 +745,11 @@ def start(message):
 
 @bot.message_handler(commands=["menu"])
 def menu_command(message):
-    bot.send_message(message.chat.id, "Выбери раздел:", reply_markup=menu_markup())
+    bot.send_message(
+        message.chat.id,
+        "Выбери раздел:",
+        reply_markup=menu_markup()
+    )
 
 
 @bot.message_handler(commands=["help"])
@@ -623,7 +772,12 @@ def reset_command(message):
     user_id = str(message.chat.id)
     state["seen_movies"][user_id] = []
     save_state()
-    bot.send_message(message.chat.id, "♻️ Повторы сброшены. Теперь могу советовать с нуля.", reply_markup=menu_markup())
+
+    bot.send_message(
+        message.chat.id,
+        "♻️ Повторы сброшены. Теперь могу советовать с нуля.",
+        reply_markup=menu_markup()
+    )
 
 
 @bot.callback_query_handler(func=lambda call: True)
@@ -676,11 +830,13 @@ def callback(call):
 
         if data == "menu_profile":
             profile = get_profile(user_id)
+
             text = (
                 "🧠 Твой вкус\n\n"
                 f"👍 Нравится: {', '.join(profile.get('likes', [])[-10:]) or 'пока пусто'}\n\n"
                 f"👎 Не нравится: {', '.join(profile.get('dislikes', [])[-10:]) or 'пока пусто'}"
             )
+
             bot.answer_callback_query(call.id)
             send_long_message(chat_id, text)
             return
@@ -688,8 +844,13 @@ def callback(call):
         if data == "menu_reset":
             state["seen_movies"][user_id] = []
             save_state()
+
             bot.answer_callback_query(call.id, "Повторы сброшены")
-            bot.send_message(chat_id, "♻️ Готово. Теперь могу снова предлагать фильмы с нуля.", reply_markup=menu_markup())
+            bot.send_message(
+                chat_id,
+                "♻️ Готово. Теперь могу снова предлагать фильмы с нуля.",
+                reply_markup=menu_markup()
+            )
             return
 
         if data.startswith("sim:"):
@@ -713,10 +874,12 @@ def callback(call):
                 return
 
             record, status = vote_movie(user_id, movie_name, "like")
+
             if status == "same":
                 bot.answer_callback_query(call.id, "Ты уже поставил лайк 👍")
             else:
                 bot.answer_callback_query(call.id, f"Лайк засчитан 👍 Всего лайков: {record['likes']}")
+
             return
 
         if data.startswith("dislike:"):
@@ -728,20 +891,24 @@ def callback(call):
                 return
 
             record, status = vote_movie(user_id, movie_name, "dislike")
+
             if status == "same":
                 bot.answer_callback_query(call.id, "Ты уже поставил дизлайк 👎")
             else:
                 bot.answer_callback_query(call.id, f"Дизлайк засчитан 👎 Всего дизлайков: {record['dislikes']}")
+
             return
 
         bot.answer_callback_query(call.id)
 
     except Exception:
         logging.exception("Ошибка callback")
+
         try:
             bot.answer_callback_query(call.id, "Ошибка")
         except Exception:
             pass
+
         bot.send_message(chat_id, "Что-то пошло не так. Попробуй ещё раз.")
 
 
@@ -751,7 +918,11 @@ def chat(message):
     text = (message.text or "").strip()
 
     if not text:
-        bot.send_message(message.chat.id, "Напиши запрос текстом.", reply_markup=menu_markup())
+        bot.send_message(
+            message.chat.id,
+            "Напиши запрос текстом.",
+            reply_markup=menu_markup()
+        )
         return
 
     try:
