@@ -24,10 +24,6 @@ def save_memory():
     with open(MEMORY_FILE, "w", encoding="utf-8") as f:
         json.dump(memory, f, ensure_ascii=False, indent=2)
 
-# 🔎 Кинопоиск
-def kinopoisk_link(query):
-    return f"https://www.kinopoisk.ru/index.php?kp_query={query.replace(' ', '%20')}"
-
 # 🎬 MENU
 def main_menu():
     markup = InlineKeyboardMarkup()
@@ -81,9 +77,6 @@ def callback(call):
     try:
         answer = ask_ai(prompt)
 
-        kp = kinopoisk_link(text)
-        answer += f"\n\n🔎 Кинопоиск: {kp}"
-
         bot.send_message(chat_id, answer)
 
     except Exception as e:
@@ -122,9 +115,6 @@ def chat(message):
 
         memory[user_id].append({"role": "assistant", "content": answer})
         save_memory()
-
-        kp = kinopoisk_link(text)
-        answer += f"\n\n🔎 Кинопоиск: {kp}"
 
         bot.send_message(message.chat.id, answer)
 
