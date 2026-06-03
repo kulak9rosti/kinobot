@@ -997,7 +997,7 @@ def callback(call):
     register_user_activity(call=call)
 
     chat_id = call.message.chat.id
-    user_id = str(chat_id)
+    user_id = str(call.from_user.id)
     data = call.data
 
     try:
