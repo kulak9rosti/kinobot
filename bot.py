@@ -1,39 +1,19 @@
 import telebot
-import requests
 import json
 import os
 from openai import OpenAI
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# 🔐 keys from Render
+# 🔐 ENV (Render)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# 🎬 SYSTEM PROMPT (строгий кино-справочник)
-SYSTEM_PROMPT = """
-Ты кино-справочник как IMDb.
-
-Правила:
-- только факты
-- без мнений
-- без советов
-- без эмоций
-
-Формат:
-
-🎬 Название (год)
-⭐ IMDb рейтинг (примерно)
-🧾 Описание: 1–3 предложения
-
-Если список — 3–5 фильмов в этом формате.
-"""
-
-# 📦 MEMORY FILE
+# 🧠 MEMORY
 MEMORY_FILE = "memory.json"
 
-# загрузка памяти
 if os.path.exists(MEMORY_FILE):
     with open(MEMORY_FILE, "r", encoding="utf-8") as f:
         memory = json.load(f)
@@ -44,72 +24,114 @@ def save_memory():
     with open(MEMORY_FILE, "w", encoding="utf-8") as f:
         json.dump(memory, f, ensure_ascii=False, indent=2)
 
-# 📷 постер (Wikipedia fallback)
-def get_poster(title):
-    try:
-        url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{title}"
-        r = requests.get(url, timeout=5)
+# 🎬 MENU
+def main_menu():
+    markup = InlineKeyboardMarkup()
 
-        if r.status_code != 200:
-            return None
+    markup.add(
+        InlineKeyboardButton("🎬 Фильмы", callback_data="movies"),
+        InlineKeyboardButton("📺 Сериалы", callback_data="series")
+    )
 
-        data = r.json()
+    markup.add(
+        InlineKeyboardButton("🔥 Топ дня", callback_data="top"),
+        InlineKeyboardButton("🎲 Случайный", callback_data="random")
+    )
 
-        if "originalimage" in data:
-            return data["originalimage"]["source"]
+    return markup
 
-    except:
-        return None
+# 🚀 START
+@bot.message_handler(commands=['start'])
+def start(message):
+    bot.send_message(
+        message.chat.id,
+        "🎬 KinoBot AI\nВыбери, что хочешь посмотреть:",
+        reply_markup=main_menu()
+    )
 
-    return None
+# 🤖 AI FUNCTION
+def ask_ai(prompt):
+    response = client.responses.create(
+        model="gpt-4.1-mini",
+        input=prompt
+    )
+    return response.output_text
 
-# 🤖 handler
-@bot.message_handler(func=lambda message: True)
-def handle(message):
-    user_id = str(message.chat.id)
-    text = message.text
+# 🎯 CALLBACK BUTTONS
+@bot.callback_query_handler(func=lambda call: True)
+def callback(call):
+    chat_id = call.message.chat.id
+    user_id = str(chat_id)
 
-    # init user memory
     if user_id not in memory:
         memory[user_id] = []
 
-    # add user message
-    memory[user_id].append({"role": "user", "content": text})
-    memory[user_id] = memory[user_id][-20:]
+    if call.data == "movies":
+        prompt = "Дай 5 фильмов как Netflix подборку. Формат: 🎬 название (год) ⭐️ рейтинг 🧾 1-2 строки описание"
 
-    try:
-        # AI request
-        response = client.responses.create(
-            model="gpt-4.1-mini",
-            input=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                *memory[user_id]
-            ]
-        )
+    elif call.data == "series":
+        prompt = "Дай 5 сериалов как Netflix подборку. Формат: 🎬 название (год) ⭐️ рейтинг 🧾 краткое описание"
 
-        answer = response.output_text
+    elif call.data == "top":
+        prompt = "Дай топ 5 фильмов мира по IMDb и популярности сейчас. Формат Netflix карточки"
 
-    except Exception as e:
-        bot.send_message(message.chat.id, "Ошибка AI запроса")
-        print("OpenAI error:", e)
+    elif call.data == "random":
+        prompt = "Выбери 1 случайный хороший фильм и дай краткое описание как IMDb"
+
+    else:
+        bot.send_message(chat_id, "Ошибка кнопки")
         return
 
-    # save assistant reply
-    memory[user_id].append({"role": "assistant", "content": answer})
-    save_memory()
-
-    # poster (safe)
-    poster = get_poster(text.replace(" ", "_"))
-
     try:
-        if poster:
-            bot.send_photo(message.chat.id, poster, caption=answer[:1020])
-        else:
-            bot.send_message(message.chat.id, answer)
+        answer = ask_ai(prompt)
+
+        # 🧠 memory
+        memory[user_id].append({"role": "assistant", "content": answer})
+        memory[user_id] = memory[user_id][-10:]
+        save_memory()
+
+        bot.send_message(chat_id, answer)
 
     except Exception as e:
-        print("Telegram send error:", e)
+        print(e)
+        bot.send_message(chat_id, "Ошибка AI запроса")
 
-# 🚀 start
-print("🎬 KinoBot запущен")
-bot.polling(none_stop=True, timeout=60)
+# 💬 FREE CHAT (обычный ввод)
+@bot.message_handler(func=lambda message: True)
+def chat(message):
+    user_id = str(message.chat.id)
+    text = message.text
+
+    if user_id not in memory:
+        memory[user_id] = []
+
+    memory[user_id].append({"role": "user", "content": text})
+    memory[user_id] = memory[user_id][-10:]
+
+    prompt = f"""
+Ты кино-справочник как IMDb.
+
+Пользователь пишет: {text}
+
+Дай краткий фактологический ответ:
+- название
+- год
+- рейтинг
+- описание (без мнений)
+"""
+
+    try:
+        answer = ask_ai(prompt)
+
+        memory[user_id].append({"role": "assistant", "content": answer})
+        save_memory()
+
+        bot.send_message(message.chat.id, answer)
+
+    except Exception as e:
+        print(e)
+        bot.send_message(message.chat.id, "Ошибка AI")
+
+# 🚀 START BOT
+print("🎬 KinoBot AI запущен")
+bot.infinity_polling(skip_pending=True)
