@@ -24,8 +24,16 @@ def save_memory():
     with open(MEMORY_FILE, "w", encoding="utf-8") as f:
         json.dump(memory, f, ensure_ascii=False, indent=2)
 
-# 🎬 LAST QUERY (для похожих фильмов)
-last_query = {}
+# 🎬 BUTTON (под каждым фильмом)
+def similar_button(movie_name):
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton(
+            "🎞 Похожие фильмы",
+            callback_data=f"sim|{movie_name}"
+        )
+    )
+    return markup
 
 # 🤖 AI
 def ask_ai(prompt):
@@ -35,59 +43,21 @@ def ask_ai(prompt):
     )
     return response.output_text
 
-# 🎬 MENU
-def main_menu():
-    markup = InlineKeyboardMarkup()
-
-    markup.add(
-        InlineKeyboardButton("🎬 Фильмы", callback_data="movies"),
-        InlineKeyboardButton("📺 Сериалы", callback_data="series")
-    )
-
-    markup.add(
-        InlineKeyboardButton("🔥 Топ дня", callback_data="top"),
-        InlineKeyboardButton("🎲 Случайный", callback_data="random")
-    )
-
-    markup.add(
-        InlineKeyboardButton("🎞 Похожие фильмы", callback_data="similar")
-    )
-
-    return markup
-
 # 🚀 START
 @bot.message_handler(commands=['start'])
 def start(message):
     bot.send_message(
         message.chat.id,
-        "🎬 KinoBot AI\nВыбери действие:",
-        reply_markup=main_menu()
+        "🎬 KinoBot AI\nНапиши фильм или жанр",
     )
 
-# 🎯 CALLBACK BUTTONS
+# 🎯 CALLBACK
 @bot.callback_query_handler(func=lambda call: True)
 def callback(call):
     chat_id = call.message.chat.id
-    user_id = str(chat_id)
 
-    if call.data == "movies":
-        prompt = "Дай 5 фильмов как Netflix подборку. Формат: 🎬 название (год) ⭐️ рейтинг 🧾 краткое описание"
-
-    elif call.data == "series":
-        prompt = "Дай 5 сериалов как Netflix подборку. Формат: 🎬 название (год) ⭐️ рейтинг 🧾 краткое описание"
-
-    elif call.data == "top":
-        prompt = "Дай топ 5 фильмов мира по IMDb сейчас. Формат Netflix карточки"
-
-    elif call.data == "random":
-        prompt = "Выбери 1 случайный хороший фильм и дай краткое описание"
-
-    elif call.data == "similar":
-        movie = last_query.get(user_id)
-
-        if not movie:
-            bot.send_message(chat_id, "Сначала напиши фильм 🎬")
-            return
+    if call.data.startswith("sim|"):
+        movie = call.data.split("|")[1]
 
         prompt = f"""
 Подбери 5 фильмов похожих на: {movie}
@@ -98,25 +68,15 @@ def callback(call):
 🧾 почему похож
 """
 
-    else:
-        return
-
-    try:
         answer = ask_ai(prompt)
         bot.send_message(chat_id, answer)
+        return
 
-    except Exception as e:
-        print(e)
-        bot.send_message(chat_id, "Ошибка AI")
-
-# 💬 CHAT MODE
+# 💬 CHAT
 @bot.message_handler(func=lambda message: True)
 def chat(message):
     user_id = str(message.chat.id)
     text = message.text
-
-    # сохраняем последний фильм/запрос
-    last_query[user_id] = text
 
     if user_id not in memory:
         memory[user_id] = []
@@ -129,14 +89,12 @@ def chat(message):
 
 Пользователь: {text}
 
-Если это фильм → дай описание.
-Если это "похожие на ..." → дай 5 фильмов.
-Если непонятно → всё равно предложи фильмы.
+Если это фильм → дай 3–5 фильмов.
 
-ФОРМАТ:
+ФОРМАТ КАЖДОГО ФИЛЬМА:
 🎬 название (год)
 ⭐️ рейтинг IMDb
-🧾 описание
+🧾 описание (1–2 строки)
 """
 
     try:
@@ -145,7 +103,19 @@ def chat(message):
         memory[user_id].append({"role": "assistant", "content": answer})
         save_memory()
 
-        bot.send_message(message.chat.id, answer)
+        chat_id = message.chat.id
+
+        movies = answer.split("\n\n")
+
+        for m in movies:
+            if m.strip():
+                title = m.split("\n")[0]
+
+                bot.send_message(
+                    chat_id,
+                    m,
+                    reply_markup=similar_button(title)
+                )
 
     except Exception as e:
         print(e)
