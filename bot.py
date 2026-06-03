@@ -27,6 +27,12 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 KINOPOISK_API_KEY = os.environ.get("KINOPOISK_API_KEY")
 
+ADMIN_IDS = {
+    admin_id.strip()
+    for admin_id in os.environ.get("ADMIN_IDS", "").split(",")
+    if admin_id.strip()
+}
+
 # Если подключён Persistent Disk на Render, поставь DATA_DIR=/var/data
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -74,7 +80,8 @@ state = load_json(STATE_FILE, {
     "seen_movies": {},
     "user_profile": {},
     "callback_movies": {},
-    "poster_cache": {}
+    "poster_cache": {},
+    "stats": {}
 })
 ratings = load_json(RATINGS_FILE, {})
 
@@ -82,6 +89,10 @@ state.setdefault("seen_movies", {})
 state.setdefault("user_profile", {})
 state.setdefault("callback_movies", {})
 state.setdefault("poster_cache", {})
+state.setdefault("stats", {})
+state["stats"].setdefault("users", {})
+state["stats"].setdefault("total_messages", 0)
+state["stats"].setdefault("total_callbacks", 0)
 
 # =========================
 # SAVE
@@ -230,6 +241,103 @@ def make_callback_key(movie_name):
 
 def get_movie_by_callback_key(key):
     return state.get("callback_movies", {}).get(key)
+
+
+# =========================
+# ADMIN
+# =========================
+
+def is_admin_user_id(user_id):
+    return str(user_id) in ADMIN_IDS
+
+
+def is_admin_message(message):
+    return message.from_user and is_admin_user_id(message.from_user.id)
+
+
+def is_admin_call(call):
+    return call.from_user and is_admin_user_id(call.from_user.id)
+
+
+def register_user_activity(message=None, call=None):
+    if message:
+        user = message.from_user
+        chat_id = str(message.chat.id)
+        activity_type = "message"
+    elif call:
+        user = call.from_user
+        chat_id = str(call.message.chat.id)
+        activity_type = "callback"
+    else:
+        return
+
+    if not user:
+        return
+
+    user_id = str(user.id)
+
+    state["stats"]["users"].setdefault(user_id, {
+        "chat_id": chat_id,
+        "username": "",
+        "first_name": "",
+        "last_name": "",
+        "messages": 0,
+        "callbacks": 0,
+        "first_seen": int(time.time()),
+        "last_seen": int(time.time())
+    })
+
+    record = state["stats"]["users"][user_id]
+    record["chat_id"] = chat_id
+    record["username"] = user.username or ""
+    record["first_name"] = user.first_name or ""
+    record["last_name"] = user.last_name or ""
+    record["last_seen"] = int(time.time())
+
+    if activity_type == "message":
+        record["messages"] = int(record.get("messages", 0)) + 1
+        state["stats"]["total_messages"] = int(state["stats"].get("total_messages", 0)) + 1
+
+    if activity_type == "callback":
+        record["callbacks"] = int(record.get("callbacks", 0)) + 1
+        state["stats"]["total_callbacks"] = int(state["stats"].get("total_callbacks", 0)) + 1
+
+    save_state()
+
+
+def get_admin_stats_text():
+    users_count = len(state.get("stats", {}).get("users", {}))
+
+    total_likes = 0
+    total_dislikes = 0
+    rated_movies = 0
+
+    for record in ratings.values():
+        likes = int(record.get("likes", 0))
+        dislikes = int(record.get("dislikes", 0))
+
+        if likes + dislikes > 0:
+            rated_movies += 1
+
+        total_likes += likes
+        total_dislikes += dislikes
+
+    poster_cache_count = len(state.get("poster_cache", {}))
+    memory_users_count = len(memory)
+    callback_count = len(state.get("callback_movies", {}))
+
+    return (
+        "👑 Админ-статистика KinoBot AI\n\n"
+        f"👥 Пользователей: {users_count}\n"
+        f"💬 Сообщений: {state['stats'].get('total_messages', 0)}\n"
+        f"🔘 Нажатий кнопок: {state['stats'].get('total_callbacks', 0)}\n\n"
+        f"🎬 Фильмов с оценками: {rated_movies}\n"
+        f"👍 Лайков всего: {total_likes}\n"
+        f"👎 Дизлайков всего: {total_dislikes}\n\n"
+        f"🖼 Постеров в кэше: {poster_cache_count}\n"
+        f"🔑 Callback-ключей: {callback_count}\n"
+        f"🧠 Пользователей в memory.json: {memory_users_count}"
+    )
 
 
 # =========================
@@ -761,11 +869,67 @@ def send_kinopoisk_top(chat_id, page=1, limit=10):
 
 
 # =========================
-# HANDLERS
+# ADMIN HANDLERS
+# =========================
+
+@bot.message_handler(commands=["myid"])
+def myid_command(message):
+    register_user_activity(message=message)
+
+    bot.send_message(
+        message.chat.id,
+        f"Твой Telegram ID:\n\n`{message.from_user.id}`",
+        parse_mode="Markdown"
+    )
+
+
+@bot.message_handler(commands=["admin"])
+def admin_command(message):
+    register_user_activity(message=message)
+
+    if not is_admin_message(message):
+        bot.send_message(message.chat.id, "⛔️ У тебя нет доступа к админке.")
+        return
+
+    bot.send_message(
+        message.chat.id,
+        "👑 Админ-команды:\n\n"
+        "/admin_stats — статистика бота\n"
+        "/admin_top — топ фильмов пользователей\n"
+        "/myid — узнать свой Telegram ID"
+    )
+
+
+@bot.message_handler(commands=["admin_stats"])
+def admin_stats_command(message):
+    register_user_activity(message=message)
+
+    if not is_admin_message(message):
+        bot.send_message(message.chat.id, "⛔️ У тебя нет доступа к этой команде.")
+        return
+
+    bot.send_message(message.chat.id, get_admin_stats_text())
+
+
+@bot.message_handler(commands=["admin_top"])
+def admin_top_command(message):
+    register_user_activity(message=message)
+
+    if not is_admin_message(message):
+        bot.send_message(message.chat.id, "⛔️ У тебя нет доступа к этой команде.")
+        return
+
+    send_long_message(message.chat.id, get_user_top_movies(limit=20))
+
+
+# =========================
+# USER HANDLERS
 # =========================
 
 @bot.message_handler(commands=["start"])
 def start(message):
+    register_user_activity(message=message)
+
     bot.send_message(
         message.chat.id,
         "🎬 KinoBot AI\n\n"
@@ -783,6 +947,8 @@ def start(message):
 
 @bot.message_handler(commands=["menu"])
 def menu_command(message):
+    register_user_activity(message=message)
+
     bot.send_message(
         message.chat.id,
         "Выбери раздел:",
@@ -792,6 +958,8 @@ def menu_command(message):
 
 @bot.message_handler(commands=["help"])
 def help_command(message):
+    register_user_activity(message=message)
+
     bot.send_message(
         message.chat.id,
         "🎬 KinoBot AI\n\n"
@@ -811,6 +979,8 @@ def help_command(message):
 
 @bot.message_handler(commands=["reset"])
 def reset_command(message):
+    register_user_activity(message=message)
+
     user_id = str(message.chat.id)
     state["seen_movies"][user_id] = []
     save_state()
@@ -824,6 +994,8 @@ def reset_command(message):
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback(call):
+    register_user_activity(call=call)
+
     chat_id = call.message.chat.id
     user_id = str(chat_id)
     data = call.data
@@ -956,6 +1128,8 @@ def callback(call):
 
 @bot.message_handler(func=lambda message: True)
 def chat(message):
+    register_user_activity(message=message)
+
     user_id = str(message.chat.id)
     text = (message.text or "").strip()
 
