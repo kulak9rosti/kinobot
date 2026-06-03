@@ -4,7 +4,7 @@ import os
 from openai import OpenAI
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# 🔐 ENV (Render)
+# 🔐 ENV
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
@@ -23,6 +23,10 @@ else:
 def save_memory():
     with open(MEMORY_FILE, "w", encoding="utf-8") as f:
         json.dump(memory, f, ensure_ascii=False, indent=2)
+
+# 🔎 Кинопоиск
+def kinopoisk_link(query):
+    return f"https://www.kinopoisk.ru/index.php?kp_query={query.replace(' ', '%20')}"
 
 # 🎬 MENU
 def main_menu():
@@ -45,11 +49,11 @@ def main_menu():
 def start(message):
     bot.send_message(
         message.chat.id,
-        "🎬 KinoBot AI\nВыбери, что хочешь посмотреть:",
+        "🎬 KinoBot AI\nВыбери действие:",
         reply_markup=main_menu()
     )
 
-# 🤖 AI FUNCTION
+# 🤖 OPENAI
 def ask_ai(prompt):
     response = client.responses.create(
         model="gpt-4.1-mini",
@@ -61,42 +65,32 @@ def ask_ai(prompt):
 @bot.callback_query_handler(func=lambda call: True)
 def callback(call):
     chat_id = call.message.chat.id
-    user_id = str(chat_id)
+    text = call.data
 
-    if user_id not in memory:
-        memory[user_id] = []
-
-    if call.data == "movies":
-        prompt = "Дай 5 фильмов как Netflix подборку. Формат: 🎬 название (год) ⭐️ рейтинг 🧾 1-2 строки описание"
-
-    elif call.data == "series":
-        prompt = "Дай 5 сериалов как Netflix подборку. Формат: 🎬 название (год) ⭐️ рейтинг 🧾 краткое описание"
-
-    elif call.data == "top":
-        prompt = "Дай топ 5 фильмов мира по IMDb и популярности сейчас. Формат Netflix карточки"
-
-    elif call.data == "random":
-        prompt = "Выбери 1 случайный хороший фильм и дай краткое описание как IMDb"
-
+    if text == "movies":
+        prompt = "Дай 5 фильмов как Netflix подборку. Формат: 🎬 название (год) ⭐️ рейтинг 🧾 описание"
+    elif text == "series":
+        prompt = "Дай 5 сериалов как Netflix подборку. Формат: 🎬 название (год) ⭐️ рейтинг 🧾 описание"
+    elif text == "top":
+        prompt = "Дай топ 5 фильмов мира по IMDb сейчас. Формат как Netflix карточки"
+    elif text == "random":
+        prompt = "Выбери 1 случайный качественный фильм и дай краткое описание"
     else:
-        bot.send_message(chat_id, "Ошибка кнопки")
         return
 
     try:
         answer = ask_ai(prompt)
 
-        # 🧠 memory
-        memory[user_id].append({"role": "assistant", "content": answer})
-        memory[user_id] = memory[user_id][-10:]
-        save_memory()
+        kp = kinopoisk_link(text)
+        answer += f"\n\n🔎 Кинопоиск: {kp}"
 
         bot.send_message(chat_id, answer)
 
     except Exception as e:
         print(e)
-        bot.send_message(chat_id, "Ошибка AI запроса")
+        bot.send_message(chat_id, "Ошибка AI")
 
-# 💬 FREE CHAT (обычный ввод)
+# 💬 CHAT MODE
 @bot.message_handler(func=lambda message: True)
 def chat(message):
     user_id = str(message.chat.id)
@@ -109,25 +103,18 @@ def chat(message):
     memory[user_id] = memory[user_id][-10:]
 
     prompt = f"""
-Ты кино-эксперт как IMDb.
+Ты кино-эксперт уровня IMDb + Netflix.
 
-Пользователь написал: {text}
+Пользователь: {text}
 
-Если это запрос на:
-- "похожие фильмы"
-- "что посмотреть если понравился фильм"
-- "как {фильм}"
-
-ТО ДЕЛАЙ:
-👉 дай 5 похожих фильмов списком
-
-Если это просто фильм:
-👉 дай описание фильма
+Если запрос про фильмы/похожие → дай 5 фильмов.
+Если название фильма → дай описание.
+Если непонятно → всё равно предложи фильмы.
 
 ФОРМАТ:
 🎬 название (год)
 ⭐️ рейтинг IMDb
-🧾 1-2 строки описание
+🧾 описание
 """
 
     try:
@@ -135,6 +122,9 @@ def chat(message):
 
         memory[user_id].append({"role": "assistant", "content": answer})
         save_memory()
+
+        kp = kinopoisk_link(text)
+        answer += f"\n\n🔎 Кинопоиск: {kp}"
 
         bot.send_message(message.chat.id, answer)
 
