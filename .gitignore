@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Bot local data
+memory.json
+state.json
+ratings.json
