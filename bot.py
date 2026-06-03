@@ -6,6 +6,7 @@ import time
 import hashlib
 import logging
 import requests
+from io import BytesIO
 from openai import OpenAI
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -26,7 +27,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 KINOPOISK_API_KEY = os.environ.get("KINOPOISK_API_KEY")
 
-# Если подключишь Persistent Disk на Render, поставь DATA_DIR=/var/data
+# Если подключён Persistent Disk на Render, поставь DATA_DIR=/var/data
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -223,6 +224,7 @@ def make_callback_key(movie_name):
         last_items = list(state["callback_movies"].items())[-2000:]
         state["callback_movies"] = dict(last_items)
 
+    save_state()
     return key
 
 
@@ -234,12 +236,40 @@ def get_movie_by_callback_key(key):
 # POSTERS
 # =========================
 
+def download_poster_image(poster_url):
+    if not poster_url:
+        return None
+
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0"
+        }
+
+        response = requests.get(
+            poster_url,
+            headers=headers,
+            timeout=20
+        )
+        response.raise_for_status()
+
+        content_type = response.headers.get("Content-Type", "")
+
+        if "image" not in content_type:
+            logging.warning(f"Poster URL вернул не картинку: {content_type}")
+            return None
+
+        image = BytesIO(response.content)
+        image.name = "poster.jpg"
+        image.seek(0)
+
+        return image
+
+    except Exception:
+        logging.exception("Не удалось скачать постер")
+        return None
+
+
 def find_kinopoisk_poster(movie_name):
-    """
-    Ищет постер по названию фильма через Kinopoisk API.
-    Для AI-подборок это нужно, потому что OpenAI даёт название,
-    а постер надо отдельно найти в базе Кинопоиска.
-    """
     if not KINOPOISK_API_KEY:
         return None
 
@@ -290,32 +320,38 @@ def find_kinopoisk_poster(movie_name):
 
 
 def send_movie_card(chat_id, text, movie_name, poster_url=None):
-    """
-    Отправляет карточку фильма.
-    Если есть постер — отправляет фото.
-    Если фото не отправилось — падает обратно на обычный текст.
-    """
     markup = movie_markup(movie_name)
 
     if poster_url:
         try:
-            # У Telegram подпись к фото ограничена, поэтому длинный текст шлём отдельно.
-            if len(text) <= 950:
-                bot.send_photo(
-                    chat_id,
-                    poster_url,
-                    caption=text,
-                    reply_markup=markup
-                )
-            else:
-                bot.send_photo(chat_id, poster_url)
-                bot.send_message(chat_id, text, reply_markup=markup)
+            image = download_poster_image(poster_url)
 
-            return
+            if image:
+                if len(text) <= 950:
+                    bot.send_photo(
+                        chat_id,
+                        image,
+                        caption=text,
+                        reply_markup=markup
+                    )
+                else:
+                    bot.send_photo(chat_id, image)
+                    bot.send_message(
+                        chat_id,
+                        text,
+                        reply_markup=markup
+                    )
+
+                return
+
         except Exception:
-            logging.exception("Не удалось отправить постер")
+            logging.exception("Не удалось отправить постер в Telegram")
 
-    bot.send_message(chat_id, text, reply_markup=markup)
+    bot.send_message(
+        chat_id,
+        text,
+        reply_markup=markup
+    )
 
 
 # =========================
@@ -733,12 +769,14 @@ def start(message):
     bot.send_message(
         message.chat.id,
         "🎬 KinoBot AI\n\n"
-        "Напиши, что хочешь посмотреть. Например:\n\n"
-        "• лучшие фильмы про космос\n"
+        "Я подберу фильм или сериал под настроение.\n\n"
+        "Напиши:\n"
+        "• фильм на вечер\n"
+        "• комедия без тупого юмора\n"
         "• фильмы как Интерстеллар\n"
-        "• комедии на вечер\n"
         "• ужасы без скримеров\n"
-        "• сериалы как Во все тяжкие",
+        "• сериал как Во все тяжкие\n\n"
+        "Я учитываю твои лайки и дизлайки, а лучшие фильмы попадают в общий топ пользователей.",
         reply_markup=menu_markup()
     )
 
@@ -756,13 +794,17 @@ def menu_command(message):
 def help_command(message):
     bot.send_message(
         message.chat.id,
-        "Просто напиши запрос обычными словами.\n\n"
-        "Примеры:\n"
-        "🎬 Что посмотреть вечером?\n"
-        "🚀 Фильмы про космос\n"
-        "🧠 Фильмы с неожиданной концовкой\n"
-        "😂 Комедии без тупого юмора\n"
-        "👨‍👩‍👧 Фильм для семьи",
+        "🎬 KinoBot AI\n\n"
+        "Я подберу фильм или сериал под настроение.\n\n"
+        "Примеры запросов:\n"
+        "• фильм на вечер\n"
+        "• комедия без тупого юмора\n"
+        "• фильмы как Интерстеллар\n"
+        "• ужасы без скримеров\n"
+        "• сериал как Во все тяжкие\n"
+        "• фильмы с неожиданной концовкой\n"
+        "• что посмотреть с девушкой\n\n"
+        "Ставь 👍 или 👎 под фильмами — так бот будет лучше понимать твой вкус.",
         reply_markup=menu_markup()
     )
 
