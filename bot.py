@@ -340,12 +340,17 @@ def get_film_description(film):
 # COUNTRY FILTERS
 # =========================
 
+# Здесь специально добавлена Индия.
+# Значит индийские фильмы НЕ попадут в "Зарубежные по годам",
+# а будут попадать в "РФ/СНГ + Индия".
 CIS_COUNTRY_KEYWORDS = [
     "россия",
     "russia",
     "ссср",
     "ussr",
     "советский союз",
+    "индия",
+    "india",
     "украина",
     "ukraine",
     "беларусь",
@@ -392,13 +397,13 @@ def is_cis_or_post_soviet_film(film):
 
 
 def passes_year_category_filter(film, category):
-    is_cis = is_cis_or_post_soviet_film(film)
+    is_cis_group = is_cis_or_post_soviet_film(film)
 
     if category == "foreign":
-        return not is_cis
+        return not is_cis_group
 
     if category == "cis":
-        return is_cis
+        return is_cis_group
 
     return True
 
@@ -809,7 +814,7 @@ def menu_markup():
         InlineKeyboardButton("🔥 Новинки 2026", callback_data="menu_new_2026"),
         InlineKeyboardButton("🎭 Жанры", callback_data="menu_genres"),
         InlineKeyboardButton("🌍 Зарубежные по годам", callback_data="menu_years_foreign"),
-        InlineKeyboardButton("🇷🇺 СНГ по годам", callback_data="menu_years_cis"),
+        InlineKeyboardButton("🇷🇺 РФ/СНГ + Индия", callback_data="menu_years_cis"),
         InlineKeyboardButton("🏆 Топ Кинопоиска", callback_data="menu_kp_top"),
         InlineKeyboardButton("⭐️ Топ пользователей", callback_data="menu_user_top"),
         InlineKeyboardButton("🎲 Случайный", callback_data="menu_random"),
@@ -855,7 +860,7 @@ def years_markup(category):
         )
     else:
         markup.add(
-            InlineKeyboardButton("🇷🇺 СНГ 2026", callback_data="year_cis:2026:0")
+            InlineKeyboardButton("🇷🇺 РФ/СНГ + Индия 2026", callback_data="year_cis:2026:0")
         )
 
     years = list(range(2025, 1989, -1))
@@ -885,7 +890,7 @@ def year_more_markup(category, year, next_offset):
     else:
         callback = f"year_cis:{year}:{next_offset}"
         choose_callback = "menu_years_cis"
-        text = f"➡️ Ещё 5 фильмов СНГ {year}"
+        text = f"➡️ Ещё 5 РФ/СНГ + Индия {year}"
 
     markup.add(
         InlineKeyboardButton(text, callback_data=callback)
@@ -1262,8 +1267,8 @@ def send_year_top(chat_id, category, year, offset=0, limit=5):
         bot.send_message(chat_id, error)
         return
 
-    category_title = "зарубежных фильмов" if category == "foreign" else "фильмов СНГ"
-    category_short = "зарубежные" if category == "foreign" else "СНГ"
+    category_title = "зарубежных фильмов" if category == "foreign" else "фильмов РФ/СНГ + Индии"
+    category_short = "зарубежные" if category == "foreign" else "РФ/СНГ + Индия"
 
     if not films:
         bot.send_message(
@@ -1504,7 +1509,7 @@ def callback(call):
             bot.answer_callback_query(call.id)
             bot.send_message(
                 chat_id,
-                "🇷🇺 Выбери год СНГ-топа.",
+                "🇷🇺 Выбери год для РФ/СНГ + Индии.",
                 reply_markup=years_markup("cis")
             )
             return
@@ -1526,9 +1531,9 @@ def callback(call):
             year_int = int(year)
 
             if year_int == 2026:
-                bot.answer_callback_query(call.id, "Ищу новинки СНГ 2026 🇷🇺")
+                bot.answer_callback_query(call.id, "Ищу РФ/СНГ + Индию 2026 🇷🇺")
             else:
-                bot.answer_callback_query(call.id, f"Ищу СНГ-топ {year} 🇷🇺")
+                bot.answer_callback_query(call.id, f"Ищу РФ/СНГ + Индию {year} 🇷🇺")
 
             send_year_top(chat_id, "cis", year_int, int(offset), limit=5)
             return
