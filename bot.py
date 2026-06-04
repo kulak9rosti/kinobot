@@ -249,17 +249,6 @@ def get_movie_by_callback_key(key):
     return state.get("callback_movies", {}).get(key)
 
 
-def is_russian_film(film):
-    countries = film.get("countries", []) or []
-
-    for country in countries:
-        name = str(country.get("country", "")).lower()
-        if "россия" in name or "russia" in name or "ссср" in name or "ussr" in name:
-            return True
-
-    return False
-
-
 def get_film_rating_value(film):
     raw = film.get("ratingKinopoisk") or film.get("rating") or film.get("ratingImdb") or 0
 
@@ -271,6 +260,78 @@ def get_film_rating_value(film):
 
 def film_has_poster(film):
     return bool(film.get("posterUrlPreview") or film.get("posterUrl"))
+
+
+# =========================
+# COUNTRY FILTERS
+# =========================
+
+CIS_COUNTRY_KEYWORDS = [
+    "россия",
+    "russia",
+    "ссср",
+    "ussr",
+    "советский союз",
+    "украина",
+    "ukraine",
+    "беларусь",
+    "belarus",
+    "казахстан",
+    "kazakhstan",
+    "армения",
+    "armenia",
+    "азербайджан",
+    "azerbaijan",
+    "грузия",
+    "georgia",
+    "молдова",
+    "moldova",
+    "узбекистан",
+    "uzbekistan",
+    "кыргызстан",
+    "киргизия",
+    "kyrgyzstan",
+    "таджикистан",
+    "tajikistan",
+    "туркменистан",
+    "turkmenistan",
+    "эстония",
+    "estonia",
+    "латвия",
+    "latvia",
+    "литва",
+    "lithuania"
+]
+
+
+def is_cis_or_post_soviet_film(film):
+    countries = film.get("countries", []) or []
+
+    for country in countries:
+        name = str(country.get("country", "")).lower().strip()
+
+        for keyword in CIS_COUNTRY_KEYWORDS:
+            if keyword in name:
+                return True
+
+    return False
+
+
+def passes_year_category_filter(film, category):
+    """
+    category:
+    - foreign: исключаем Россию/СССР/СНГ/постсоветские страны
+    - cis: показываем только Россию/СССР/СНГ/постсоветские страны
+    """
+    is_cis = is_cis_or_post_soviet_film(film)
+
+    if category == "foreign":
+        return not is_cis
+
+    if category == "cis":
+        return is_cis
+
+    return True
 
 
 # =========================
@@ -676,7 +737,8 @@ def menu_markup():
         InlineKeyboardButton("📺 Сериалы", callback_data="menu_series"),
         InlineKeyboardButton("🔥 Новинки 2026", callback_data="menu_new_2026"),
         InlineKeyboardButton("🎭 Жанры", callback_data="menu_genres"),
-        InlineKeyboardButton("📅 Топ по годам", callback_data="menu_years"),
+        InlineKeyboardButton("🌍 Зарубежные по годам", callback_data="menu_years_foreign"),
+        InlineKeyboardButton("🇷🇺 СНГ по годам", callback_data="menu_years_cis"),
         InlineKeyboardButton("🏆 Топ Кинопоиска", callback_data="menu_kp_top"),
         InlineKeyboardButton("⭐️ Топ пользователей", callback_data="menu_user_top"),
         InlineKeyboardButton("🎲 Случайный", callback_data="menu_random"),
@@ -713,18 +775,28 @@ def genres_markup():
     return markup
 
 
-def years_markup():
+def years_markup(category):
     markup = InlineKeyboardMarkup(row_width=2)
 
-    markup.add(
-        InlineKeyboardButton("🔥 Новинки 2026", callback_data="year_top:2026:0")
-    )
+    if category == "foreign":
+        markup.add(
+            InlineKeyboardButton("🔥 Новинки 2026", callback_data="year_foreign:2026:0")
+        )
+    else:
+        markup.add(
+            InlineKeyboardButton("🇷🇺 СНГ 2026", callback_data="year_cis:2026:0")
+        )
 
     years = list(range(2025, 1989, -1))
 
     for year in years:
+        if category == "foreign":
+            callback = f"year_foreign:{year}:0"
+        else:
+            callback = f"year_cis:{year}:0"
+
         markup.add(
-            InlineKeyboardButton(str(year), callback_data=f"year_top:{year}:0")
+            InlineKeyboardButton(str(year), callback_data=callback)
         )
 
     markup.add(InlineKeyboardButton("⬅️ Назад", callback_data="menu_back"))
@@ -732,15 +804,26 @@ def years_markup():
     return markup
 
 
-def year_more_markup(year, next_offset):
+def year_more_markup(category, year, next_offset):
     markup = InlineKeyboardMarkup(row_width=1)
+
+    if category == "foreign":
+        callback = f"year_foreign:{year}:{next_offset}"
+        choose_callback = "menu_years_foreign"
+        text = f"➡️ Ещё 5 зарубежных фильмов {year}"
+    else:
+        callback = f"year_cis:{year}:{next_offset}"
+        choose_callback = "menu_years_cis"
+        text = f"➡️ Ещё 5 фильмов СНГ {year}"
+
     markup.add(
-        InlineKeyboardButton(
-            f"➡️ Ещё 5 фильмов {year}",
-            callback_data=f"year_top:{year}:{next_offset}"
-        )
+        InlineKeyboardButton(text, callback_data=callback)
     )
-    markup.add(InlineKeyboardButton("📅 Выбрать другой год", callback_data="menu_years"))
+
+    markup.add(
+        InlineKeyboardButton("📅 Выбрать другой год", callback_data=choose_callback)
+    )
+
     return markup
 
 
@@ -964,15 +1047,16 @@ def get_kinopoisk_top_films(page=1, limit=5):
     return films, None
 
 
-def get_foreign_top_by_year(year, offset=0, limit=5):
+def get_top_by_year(category, year, offset=0, limit=5):
     if not KINOPOISK_API_KEY:
         return None, "Не найден KINOPOISK_API_KEY. Добавь его в Render → Environment."
 
+    category = str(category)
     year = int(year)
     offset = int(offset)
 
     now = time.time()
-    cache_key = str(year)
+    cache_key = f"{category}:{year}"
 
     cached = KP_YEAR_CACHE.get(cache_key)
     if cached and now - cached["time"] < KP_CACHE_TTL_SECONDS:
@@ -988,12 +1072,8 @@ def get_foreign_top_by_year(year, offset=0, limit=5):
 
     collected = []
 
-    # Для 2026 делаем фильтр строже:
-    # фильм должен иметь постер и рейтинг. Это не гарантирует онлайн-доступ,
-    # но убирает пустые карточки и фильмы, которые ещё не появились нормально в базе.
     is_new_year = year == 2026
-
-    max_pages = 10 if is_new_year else 7
+    max_pages = 10 if is_new_year else 8
     min_rating = 5.0 if is_new_year else 6.0
 
     for page in range(1, max_pages + 1):
@@ -1025,7 +1105,7 @@ def get_foreign_top_by_year(year, offset=0, limit=5):
             break
 
         for film in items:
-            if is_russian_film(film):
+            if not passes_year_category_filter(film, category):
                 continue
 
             name = film.get("nameRu") or film.get("nameOriginal") or ""
@@ -1103,32 +1183,28 @@ def send_kinopoisk_top(chat_id, page=1, limit=5):
     save_ratings()
 
 
-def send_year_top(chat_id, year, offset=0, limit=5):
-    films, error = get_foreign_top_by_year(year, offset=offset, limit=limit)
+def send_year_top(chat_id, category, year, offset=0, limit=5):
+    films, error = get_top_by_year(category, year, offset=offset, limit=limit)
 
     if error:
         bot.send_message(chat_id, error)
         return
 
+    category_title = "зарубежных фильмов" if category == "foreign" else "фильмов СНГ"
+    category_short = "зарубежные" if category == "foreign" else "СНГ"
+
     if not films:
-        if int(year) == 2026:
-            bot.send_message(
-                chat_id,
-                "Пока не нашёл достаточно зарубежных фильмов 2026 с рейтингом и постером.\n\n"
-                "Попробуй позже или выбери 2025.",
-                reply_markup=years_markup()
-            )
-        else:
-            bot.send_message(
-                chat_id,
-                f"Не нашёл ещё зарубежных фильмов за {year}. Попробуй другой год.",
-                reply_markup=years_markup()
-            )
+        bot.send_message(
+            chat_id,
+            f"Пока не нашёл достаточно {category_title} за {year}.\n\n"
+            "Попробуй другой год или нажми позже.",
+            reply_markup=years_markup(category)
+        )
         return
 
     start_number = offset + 1
 
-    if int(year) == 2026:
+    if int(year) == 2026 and category == "foreign":
         header = (
             "🔥 Зарубежные новинки 2026\n\n"
             "Показываю фильмы, которые уже появились в базе Кинопоиска, "
@@ -1136,20 +1212,34 @@ def send_year_top(chat_id, year, offset=0, limit=5):
             "Доступность онлайн может отличаться.\n"
             f"Показываю {start_number}–{offset + len(films)}"
         )
+    elif int(year) == 2026 and category == "cis":
+        header = (
+            "🇷🇺 Новинки СНГ 2026\n\n"
+            "Показываю фильмы России, СССР/СНГ/постсоветских стран, "
+            "которые уже появились в базе Кинопоиска, имеют рейтинг и постер.\n\n"
+            "Доступность онлайн может отличаться.\n"
+            f"Показываю {start_number}–{offset + len(films)}"
+        )
+    elif category == "foreign":
+        header = (
+            f"🌍 Топ зарубежных фильмов {year}\n"
+            "Без России, СССР, СНГ и постсоветских стран\n"
+            f"Показываю {start_number}–{offset + len(films)}"
+        )
     else:
         header = (
-            f"📅 Топ зарубежных фильмов {year}\n"
-            f"Без российских фильмов\n"
+            f"🇷🇺 Топ фильмов СНГ {year}\n"
+            "Россия, СССР, СНГ и постсоветские страны\n"
             f"Показываю {start_number}–{offset + len(films)}"
         )
 
     bot.send_message(chat_id, header)
 
     for i, film in enumerate(films, start=start_number):
-        if int(year) == 2026:
-            source_text = "Зарубежная новинка 2026 из базы Кинопоиска"
-        else:
+        if category == "foreign":
             source_text = f"Зарубежный фильм из топа {year}"
+        else:
+            source_text = f"Фильм СНГ из топа {year}"
 
         movie_name, text = format_kinopoisk_film(
             film,
@@ -1164,8 +1254,8 @@ def send_year_top(chat_id, year, offset=0, limit=5):
 
     bot.send_message(
         chat_id,
-        f"Хочешь ещё фильмы за {year}?",
-        reply_markup=year_more_markup(year, offset + limit)
+        f"Хочешь ещё {category_short} фильмы за {year}?",
+        reply_markup=year_more_markup(category, year, offset + limit)
     )
 
     save_state()
@@ -1336,8 +1426,8 @@ def callback(call):
             return
 
         if data == "menu_new_2026":
-            bot.answer_callback_query(call.id, "Ищу новинки 2026 🔥")
-            send_year_top(chat_id, 2026, offset=0, limit=5)
+            bot.answer_callback_query(call.id, "Ищу зарубежные новинки 2026 🔥")
+            send_year_top(chat_id, "foreign", 2026, offset=0, limit=5)
             return
 
         if data == "menu_random":
@@ -1350,27 +1440,49 @@ def callback(call):
             bot.send_message(chat_id, "🎭 Выбери жанр:", reply_markup=genres_markup())
             return
 
-        if data == "menu_years":
+        if data == "menu_years_foreign":
             bot.answer_callback_query(call.id)
             bot.send_message(
                 chat_id,
-                "📅 Выбери год.\n\n"
-                "Я покажу топ-5 зарубежных фильмов этого года без российских фильмов.\n\n"
+                "🌍 Выбери год зарубежного топа.\n\n"
+                "Покажу топ-5 фильмов без России, СССР, СНГ и постсоветских стран.\n\n"
                 "Для 2026 показываю новинки, которые уже появились в базе с рейтингом и постером.",
-                reply_markup=years_markup()
+                reply_markup=years_markup("foreign")
             )
             return
 
-        if data.startswith("year_top:"):
+        if data == "menu_years_cis":
+            bot.answer_callback_query(call.id)
+            bot.send_message(
+                chat_id,
+                "🇷🇺 Выбери год СНГ-топа.\n\n"
+                "Покажу топ-5 фильмов России, СССР, СНГ и постсоветских стран.",
+                reply_markup=years_markup("cis")
+            )
+            return
+
+        if data.startswith("year_foreign:"):
             _, year, offset = data.split(":", 2)
             year_int = int(year)
 
             if year_int == 2026:
-                bot.answer_callback_query(call.id, "Ищу новинки 2026 🔥")
+                bot.answer_callback_query(call.id, "Ищу зарубежные новинки 2026 🔥")
             else:
-                bot.answer_callback_query(call.id, f"Ищу топ фильмов {year} 📅")
+                bot.answer_callback_query(call.id, f"Ищу зарубежный топ {year} 🌍")
 
-            send_year_top(chat_id, year_int, int(offset), limit=5)
+            send_year_top(chat_id, "foreign", year_int, int(offset), limit=5)
+            return
+
+        if data.startswith("year_cis:"):
+            _, year, offset = data.split(":", 2)
+            year_int = int(year)
+
+            if year_int == 2026:
+                bot.answer_callback_query(call.id, "Ищу новинки СНГ 2026 🇷🇺")
+            else:
+                bot.answer_callback_query(call.id, f"Ищу СНГ-топ {year} 🇷🇺")
+
+            send_year_top(chat_id, "cis", year_int, int(offset), limit=5)
             return
 
         if data.startswith("genre:"):
