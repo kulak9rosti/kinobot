@@ -80,6 +80,7 @@ state = load_json(STATE_FILE, {
     "user_profile": {},
     "callback_movies": {},
     "poster_cache": {},
+    "film_detail_cache": {},
     "stats": {}
 })
 ratings = load_json(RATINGS_FILE, {})
@@ -88,6 +89,7 @@ state.setdefault("seen_movies", {})
 state.setdefault("user_profile", {})
 state.setdefault("callback_movies", {})
 state.setdefault("poster_cache", {})
+state.setdefault("film_detail_cache", {})
 state.setdefault("stats", {})
 state["stats"].setdefault("users", {})
 state["stats"].setdefault("total_messages", 0)
@@ -262,6 +264,78 @@ def film_has_poster(film):
     return bool(film.get("posterUrlPreview") or film.get("posterUrl"))
 
 
+def shorten_text(text, limit=260):
+    text = str(text or "").strip()
+
+    if not text:
+        return ""
+
+    text = re.sub(r"\s+", " ", text)
+
+    if len(text) <= limit:
+        return text
+
+    return text[:limit].rsplit(" ", 1)[0] + "..."
+
+
+def get_kinopoisk_id(film):
+    return (
+        film.get("kinopoiskId")
+        or film.get("filmId")
+        or film.get("id")
+    )
+
+
+def get_film_description(film):
+    description = (
+        film.get("shortDescription")
+        or film.get("description")
+        or ""
+    )
+
+    if description:
+        return shorten_text(description)
+
+    kinopoisk_id = get_kinopoisk_id(film)
+
+    if not kinopoisk_id or not KINOPOISK_API_KEY:
+        return "Описание пока не найдено."
+
+    cache_key = str(kinopoisk_id)
+
+    cached = state.get("film_detail_cache", {}).get(cache_key)
+    if cached:
+        return cached
+
+    url = f"https://kinopoiskapiunofficial.tech/api/v2.2/films/{kinopoisk_id}"
+
+    headers = {
+        "X-API-KEY": KINOPOISK_API_KEY,
+        "Content-Type": "application/json"
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+    except Exception:
+        logging.exception(f"Не удалось получить описание фильма {kinopoisk_id}")
+        return "Описание пока не найдено."
+
+    description = (
+        data.get("shortDescription")
+        or data.get("description")
+        or ""
+    )
+
+    description = shorten_text(description) or "Описание пока не найдено."
+
+    state["film_detail_cache"][cache_key] = description
+    save_state()
+
+    return description
+
+
 # =========================
 # COUNTRY FILTERS
 # =========================
@@ -318,11 +392,6 @@ def is_cis_or_post_soviet_film(film):
 
 
 def passes_year_category_filter(film, category):
-    """
-    category:
-    - foreign: исключаем Россию/СССР/СНГ/постсоветские страны
-    - cis: показываем только Россию/СССР/СНГ/постсоветские страны
-    """
     is_cis = is_cis_or_post_soviet_film(film)
 
     if category == "foreign":
@@ -410,6 +479,7 @@ def get_admin_stats_text():
         total_dislikes += dislikes
 
     poster_cache_count = len(state.get("poster_cache", {}))
+    detail_cache_count = len(state.get("film_detail_cache", {}))
     memory_users_count = len(memory)
     callback_count = len(state.get("callback_movies", {}))
 
@@ -422,6 +492,7 @@ def get_admin_stats_text():
         f"👍 Лайков всего: {total_likes}\n"
         f"👎 Дизлайков всего: {total_dislikes}\n\n"
         f"🖼 Постеров в кэше: {poster_cache_count}\n"
+        f"🧾 Описаний в кэше: {detail_cache_count}\n"
         f"🔑 Callback-ключей: {callback_count}\n"
         f"🧠 Пользователей в memory.json: {memory_users_count}"
     )
@@ -443,7 +514,7 @@ def download_poster_image(poster_url):
         response = requests.get(
             poster_url,
             headers=headers,
-            timeout=20
+            timeout=7
         )
         response.raise_for_status()
 
@@ -1073,8 +1144,10 @@ def get_top_by_year(category, year, offset=0, limit=5):
     collected = []
 
     is_new_year = year == 2026
-    max_pages = 10 if is_new_year else 8
-    min_rating = 5.0 if is_new_year else 6.0
+    max_pages = 15 if is_new_year else 8
+
+    # Для 2026 не требуем рейтинг, потому что у новых фильмов его часто ещё нет.
+    min_rating = 0 if is_new_year else 6.0
 
     for page in range(1, max_pages + 1):
         params = {
@@ -1117,9 +1190,6 @@ def get_top_by_year(category, year, offset=0, limit=5):
                 if not film_has_poster(film):
                     continue
 
-                if get_film_rating_value(film) < 5.0:
-                    continue
-
             collected.append(film)
 
         if len(collected) >= offset + limit + 10:
@@ -1133,7 +1203,7 @@ def get_top_by_year(category, year, offset=0, limit=5):
     return collected[offset:offset + limit], None
 
 
-def format_kinopoisk_film(film, index=None, source_text="Из топа Кинопоиска"):
+def format_kinopoisk_film(film, index=None, source_text=""):
     name = film.get("nameRu") or film.get("nameOriginal") or "Без названия"
     year = film.get("year") or "—"
     rating = film.get("rating") or film.get("ratingKinopoisk") or "—"
@@ -1148,6 +1218,8 @@ def format_kinopoisk_film(film, index=None, source_text="Из топа Кино�
         c.get("country", "") for c in countries[:3] if c.get("country")
     ) or "—"
 
+    description = get_film_description(film)
+
     prefix = f"{index}. " if index else ""
     movie_name = f"{name} ({year})"
 
@@ -1156,7 +1228,7 @@ def format_kinopoisk_film(film, index=None, source_text="Из топа Кино�
         f"⭐️ Кинопоиск: {rating}\n"
         f"🎭 Жанр: {genres_text}\n"
         f"🌍 Страна: {countries_text}\n"
-        f"🧾 {source_text}"
+        f"🧾 {description}"
     )
 
     return movie_name, text
@@ -1204,47 +1276,11 @@ def send_year_top(chat_id, category, year, offset=0, limit=5):
 
     start_number = offset + 1
 
-    if int(year) == 2026 and category == "foreign":
-        header = (
-            "🔥 Зарубежные новинки 2026\n\n"
-            "Показываю фильмы, которые уже появились в базе Кинопоиска, "
-            "имеют рейтинг и постер.\n\n"
-            "Доступность онлайн может отличаться.\n"
-            f"Показываю {start_number}–{offset + len(films)}"
-        )
-    elif int(year) == 2026 and category == "cis":
-        header = (
-            "🇷🇺 Новинки СНГ 2026\n\n"
-            "Показываю фильмы России, СССР/СНГ/постсоветских стран, "
-            "которые уже появились в базе Кинопоиска, имеют рейтинг и постер.\n\n"
-            "Доступность онлайн может отличаться.\n"
-            f"Показываю {start_number}–{offset + len(films)}"
-        )
-    elif category == "foreign":
-        header = (
-            f"🌍 Топ зарубежных фильмов {year}\n"
-            "Без России, СССР, СНГ и постсоветских стран\n"
-            f"Показываю {start_number}–{offset + len(films)}"
-        )
-    else:
-        header = (
-            f"🇷🇺 Топ фильмов СНГ {year}\n"
-            "Россия, СССР, СНГ и постсоветские страны\n"
-            f"Показываю {start_number}–{offset + len(films)}"
-        )
-
-    bot.send_message(chat_id, header)
-
+    # Без отдельной шапки. Сразу отправляем карточки фильмов.
     for i, film in enumerate(films, start=start_number):
-        if category == "foreign":
-            source_text = f"Зарубежный фильм из топа {year}"
-        else:
-            source_text = f"Фильм СНГ из топа {year}"
-
         movie_name, text = format_kinopoisk_film(
             film,
-            index=i,
-            source_text=source_text
+            index=i
         )
 
         poster_url = film.get("posterUrlPreview") or film.get("posterUrl")
@@ -1291,6 +1327,7 @@ def admin_command(message):
         "/admin_stats — статистика бота\n"
         "/admin_top — топ фильмов пользователей\n"
         "/admin_clear_posters — очистить кэш постеров\n"
+        "/admin_clear_details — очистить кэш описаний\n"
         "/myid — узнать свой Telegram ID"
     )
 
@@ -1329,6 +1366,20 @@ def admin_clear_posters_command(message):
     save_state()
 
     bot.send_message(message.chat.id, "🖼 Кэш постеров очищен.")
+
+
+@bot.message_handler(commands=["admin_clear_details"])
+def admin_clear_details_command(message):
+    register_user_activity(message=message)
+
+    if not is_admin_message(message):
+        bot.send_message(message.chat.id, "⛔️ У тебя нет доступа к этой команде.")
+        return
+
+    state["film_detail_cache"] = {}
+    save_state()
+
+    bot.send_message(message.chat.id, "🧾 Кэш описаний очищен.")
 
 
 # =========================
@@ -1444,9 +1495,7 @@ def callback(call):
             bot.answer_callback_query(call.id)
             bot.send_message(
                 chat_id,
-                "🌍 Выбери год зарубежного топа.\n\n"
-                "Покажу топ-5 фильмов без России, СССР, СНГ и постсоветских стран.\n\n"
-                "Для 2026 показываю новинки, которые уже появились в базе с рейтингом и постером.",
+                "🌍 Выбери год зарубежного топа.",
                 reply_markup=years_markup("foreign")
             )
             return
@@ -1455,8 +1504,7 @@ def callback(call):
             bot.answer_callback_query(call.id)
             bot.send_message(
                 chat_id,
-                "🇷🇺 Выбери год СНГ-топа.\n\n"
-                "Покажу топ-5 фильмов России, СССР, СНГ и постсоветских стран.",
+                "🇷🇺 Выбери год СНГ-топа.",
                 reply_markup=years_markup("cis")
             )
             return
