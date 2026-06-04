@@ -340,8 +340,8 @@ def get_film_description(film):
 # COUNTRY FILTERS
 # =========================
 
-# Здесь специально добавлена Индия.
-# Значит индийские фильмы НЕ попадут в "Зарубежные по годам",
+# Индия специально добавлена в РФ/СНГ-группу:
+# значит индийские фильмы НЕ попадут в "Зарубежные по годам",
 # а будут попадать в "РФ/СНГ + Индия".
 CIS_COUNTRY_KEYWORDS = [
     "россия",
@@ -406,6 +406,39 @@ def passes_year_category_filter(film, category):
         return is_cis_group
 
     return True
+
+
+# =========================
+# YEAR TOP EXCLUSIONS
+# =========================
+
+EXCLUDED_YEAR_TOP_KEYWORDS = [
+    "bbc",
+    "би-би-си",
+    "би би си"
+]
+
+
+def is_excluded_from_year_top(film):
+    """
+    Убирает из подборок по годам нежелательные фильмы/документалки,
+    например BBC.
+    """
+    text_parts = [
+        film.get("nameRu") or "",
+        film.get("nameOriginal") or "",
+        film.get("nameEn") or "",
+        film.get("description") or "",
+        film.get("shortDescription") or ""
+    ]
+
+    text = " ".join(text_parts).lower()
+
+    for keyword in EXCLUDED_YEAR_TOP_KEYWORDS:
+        if keyword in text:
+            return True
+
+    return False
 
 
 # =========================
@@ -1183,6 +1216,9 @@ def get_top_by_year(category, year, offset=0, limit=5):
             break
 
         for film in items:
+            if is_excluded_from_year_top(film):
+                continue
+
             if not passes_year_category_filter(film, category):
                 continue
 
@@ -1281,7 +1317,6 @@ def send_year_top(chat_id, category, year, offset=0, limit=5):
 
     start_number = offset + 1
 
-    # Без отдельной шапки. Сразу отправляем карточки фильмов.
     for i, film in enumerate(films, start=start_number):
         movie_name, text = format_kinopoisk_film(
             film,
