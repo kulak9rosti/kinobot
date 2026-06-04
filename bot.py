@@ -33,7 +33,6 @@ ADMIN_IDS = {
     if admin_id.strip()
 }
 
-# Если подключён Persistent Disk на Render, поставь DATA_DIR=/var/data
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -225,6 +224,13 @@ def clean_title_for_search(movie_name):
     return title
 
 
+def extract_year_from_title(movie_name):
+    match = re.search(r"\((\d{4})\)", str(movie_name))
+    if match:
+        return match.group(1)
+    return None
+
+
 def make_callback_key(movie_name):
     raw = f"{movie_name}:{time.time()}"
     key = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
@@ -243,6 +249,30 @@ def get_movie_by_callback_key(key):
     return state.get("callback_movies", {}).get(key)
 
 
+def is_russian_film(film):
+    countries = film.get("countries", []) or []
+
+    for country in countries:
+        name = str(country.get("country", "")).lower()
+        if "россия" in name or "russia" in name or "ссср" in name or "ussr" in name:
+            return True
+
+    return False
+
+
+def get_film_rating_value(film):
+    raw = film.get("ratingKinopoisk") or film.get("rating") or film.get("ratingImdb") or 0
+
+    try:
+        return float(str(raw).replace(",", "."))
+    except Exception:
+        return 0.0
+
+
+def film_has_poster(film):
+    return bool(film.get("posterUrlPreview") or film.get("posterUrl"))
+
+
 # =========================
 # ADMIN
 # =========================
@@ -253,10 +283,6 @@ def is_admin_user_id(user_id):
 
 def is_admin_message(message):
     return message.from_user and is_admin_user_id(message.from_user.id)
-
-
-def is_admin_call(call):
-    return call.from_user and is_admin_user_id(call.from_user.id)
 
 
 def register_user_activity(message=None, call=None):
@@ -377,16 +403,48 @@ def download_poster_image(poster_url):
         return None
 
 
+def title_similarity_score(search_title, film):
+    search_clean = normalize_movie_key(search_title)
+
+    name_ru = film.get("nameRu") or ""
+    name_en = film.get("nameEn") or ""
+    name_original = film.get("nameOriginal") or ""
+
+    names = [
+        normalize_movie_key(name_ru),
+        normalize_movie_key(name_en),
+        normalize_movie_key(name_original)
+    ]
+
+    score = 0
+
+    for name in names:
+        if not name:
+            continue
+
+        if name == search_clean:
+            score = max(score, 100)
+        elif name.startswith(search_clean + " "):
+            score = max(score, 80)
+        elif f" {search_clean} " in f" {name} ":
+            score = max(score, 60)
+        elif search_clean in name:
+            score = max(score, 30)
+
+    return score
+
+
 def find_kinopoisk_poster(movie_name):
     if not KINOPOISK_API_KEY:
         return None
 
     search_title = clean_title_for_search(movie_name)
+    search_year = extract_year_from_title(movie_name)
 
     if not search_title:
         return None
 
-    cache_key = normalize_movie_key(search_title)
+    cache_key = normalize_movie_key(movie_name)
 
     cached = state.get("poster_cache", {}).get(cache_key)
     if cached:
@@ -417,12 +475,42 @@ def find_kinopoisk_poster(movie_name):
     if not films:
         return None
 
-    film = films[0]
-    poster_url = film.get("posterUrlPreview") or film.get("posterUrl")
+    candidates = []
 
-    if poster_url:
-        state["poster_cache"][cache_key] = poster_url
-        save_state()
+    for film in films:
+        score = title_similarity_score(search_title, film)
+        film_year = str(film.get("year") or "")
+
+        if search_year and film_year == search_year:
+            score += 50
+        elif search_year and film_year and film_year != search_year:
+            score -= 20
+
+        film_type = str(film.get("type") or "").lower()
+
+        if "film" in film_type or "фильм" in film_type:
+            score += 10
+        elif "series" in film_type or "serial" in film_type:
+            score -= 30
+
+        poster_url = film.get("posterUrlPreview") or film.get("posterUrl")
+
+        if poster_url:
+            candidates.append((score, film, poster_url))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+
+    best_score, best_film, poster_url = candidates[0]
+
+    if best_score < 50:
+        logging.warning(f"Слабое совпадение постера для {movie_name}: score={best_score}")
+        return None
+
+    state["poster_cache"][cache_key] = poster_url
+    save_state()
 
     return poster_url
 
@@ -586,12 +674,14 @@ def menu_markup():
     markup.add(
         InlineKeyboardButton("🎬 Фильмы", callback_data="menu_movies"),
         InlineKeyboardButton("📺 Сериалы", callback_data="menu_series"),
+        InlineKeyboardButton("🔥 Новинки 2026", callback_data="menu_new_2026"),
         InlineKeyboardButton("🎭 Жанры", callback_data="menu_genres"),
+        InlineKeyboardButton("📅 Топ по годам", callback_data="menu_years"),
         InlineKeyboardButton("🏆 Топ Кинопоиска", callback_data="menu_kp_top"),
         InlineKeyboardButton("⭐️ Топ пользователей", callback_data="menu_user_top"),
         InlineKeyboardButton("🎲 Случайный", callback_data="menu_random"),
         InlineKeyboardButton("🧠 Мой вкус", callback_data="menu_profile"),
-        InlineKeyboardButton("♻️ Сбросить повторы", callback_data="menu_reset")
+        InlineKeyboardButton("♻️ Начать подбор заново", callback_data="menu_reset")
     )
 
     return markup
@@ -623,6 +713,37 @@ def genres_markup():
     return markup
 
 
+def years_markup():
+    markup = InlineKeyboardMarkup(row_width=2)
+
+    markup.add(
+        InlineKeyboardButton("🔥 Новинки 2026", callback_data="year_top:2026:0")
+    )
+
+    years = list(range(2025, 1989, -1))
+
+    for year in years:
+        markup.add(
+            InlineKeyboardButton(str(year), callback_data=f"year_top:{year}:0")
+        )
+
+    markup.add(InlineKeyboardButton("⬅️ Назад", callback_data="menu_back"))
+
+    return markup
+
+
+def year_more_markup(year, next_offset):
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton(
+            f"➡️ Ещё 5 фильмов {year}",
+            callback_data=f"year_top:{year}:{next_offset}"
+        )
+    )
+    markup.add(InlineKeyboardButton("📅 Выбрать другой год", callback_data="menu_years"))
+    return markup
+
+
 def movie_markup(movie_name):
     key = make_callback_key(movie_name)
 
@@ -650,6 +771,9 @@ def ask_ai(user_prompt):
 Отвечай на русском языке.
 
 Жёсткие правила:
+- если просят подборку, выдавай строго 5 фильмов, не больше
+- если просят похожие фильмы, выдавай строго 5 фильмов, не больше
+- если просят случайный фильм, выдавай строго 1 фильм
 - не добавляй английский перевод названия фильма
 - не пиши название в формате "русское / английское"
 - показывай только русское название и год
@@ -682,17 +806,17 @@ def build_prompt(user_id, user_text, mode="search"):
     profile = get_profile(user_id)
 
     if mode == "similar":
-        task = f"Подбери 5 фильмов, похожих на: {user_text}"
+        task = f"Подбери строго 5 фильмов, похожих на: {user_text}"
     elif mode == "series":
-        task = "Подбери 5 сильных сериалов."
+        task = "Подбери строго 5 сильных сериалов."
     elif mode == "random":
-        task = "Подбери 1 случайный хороший фильм, который реально стоит посмотреть."
+        task = "Подбери строго 1 случайный хороший фильм, который реально стоит посмотреть."
     elif mode == "genre":
-        task = f"Подбери 5 лучших фильмов в жанре: {user_text}."
+        task = f"Подбери строго 5 лучших фильмов в жанре: {user_text}."
     elif mode == "movies":
-        task = "Подбери 5 хороших фильмов как умную Netflix-подборку."
+        task = "Подбери строго 5 хороших фильмов как умную Netflix-подборку."
     else:
-        task = f"Запрос пользователя: {user_text}. Подбери 5 подходящих фильмов или сериалов."
+        task = f"Запрос пользователя: {user_text}. Подбери строго 5 подходящих фильмов или сериалов."
 
     return f"""
 {task}
@@ -737,12 +861,26 @@ def send_recommendations(chat_id, user_id, user_text, mode="search"):
     memory[user_id] = memory[user_id][-20:]
 
     blocks = split_recommendation_blocks(answer)
+
+    limit_by_mode = {
+        "random": 1,
+        "movies": 5,
+        "series": 5,
+        "genre": 5,
+        "similar": 5,
+        "search": 5
+    }
+
+    max_movies = limit_by_mode.get(mode, 5)
+
+    movie_blocks = [
+        block for block in blocks
+        if "🎬" in block
+    ][:max_movies]
+
     sent_any = False
 
-    for block in blocks:
-        if "🎬" not in block:
-            continue
-
+    for block in movie_blocks:
         movie_name = extract_movie_name(block)
         add_seen(user_id, movie_name)
 
@@ -771,10 +909,12 @@ KP_CACHE = {
     "films": []
 }
 
+KP_YEAR_CACHE = {}
+
 KP_CACHE_TTL_SECONDS = 60 * 60 * 6
 
 
-def get_kinopoisk_top_films(page=1, limit=10):
+def get_kinopoisk_top_films(page=1, limit=5):
     if not KINOPOISK_API_KEY:
         return None, "Не найден KINOPOISK_API_KEY. Добавь его в Render → Environment."
 
@@ -824,7 +964,96 @@ def get_kinopoisk_top_films(page=1, limit=10):
     return films, None
 
 
-def format_kinopoisk_film(film, index=None):
+def get_foreign_top_by_year(year, offset=0, limit=5):
+    if not KINOPOISK_API_KEY:
+        return None, "Не найден KINOPOISK_API_KEY. Добавь его в Render → Environment."
+
+    year = int(year)
+    offset = int(offset)
+
+    now = time.time()
+    cache_key = str(year)
+
+    cached = KP_YEAR_CACHE.get(cache_key)
+    if cached and now - cached["time"] < KP_CACHE_TTL_SECONDS:
+        films = cached["films"]
+        return films[offset:offset + limit], None
+
+    url = "https://kinopoiskapiunofficial.tech/api/v2.2/films"
+
+    headers = {
+        "X-API-KEY": KINOPOISK_API_KEY,
+        "Content-Type": "application/json"
+    }
+
+    collected = []
+
+    # Для 2026 делаем фильтр строже:
+    # фильм должен иметь постер и рейтинг. Это не гарантирует онлайн-доступ,
+    # но убирает пустые карточки и фильмы, которые ещё не появились нормально в базе.
+    is_new_year = year == 2026
+
+    max_pages = 10 if is_new_year else 7
+    min_rating = 5.0 if is_new_year else 6.0
+
+    for page in range(1, max_pages + 1):
+        params = {
+            "order": "RATING",
+            "type": "FILM",
+            "ratingFrom": min_rating,
+            "ratingTo": 10,
+            "yearFrom": year,
+            "yearTo": year,
+            "page": page
+        }
+
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+        except requests.exceptions.HTTPError as e:
+            status = getattr(e.response, "status_code", "?")
+            logging.exception("Kinopoisk year top HTTP error")
+            return None, f"Кинопоиск вернул ошибку {status}. Проверь API-ключ или лимиты."
+        except Exception:
+            logging.exception("Kinopoisk year top error")
+            return None, "Не получилось получить топ по году. Попробуй позже."
+
+        items = data.get("items", []) or data.get("films", [])
+
+        if not items:
+            break
+
+        for film in items:
+            if is_russian_film(film):
+                continue
+
+            name = film.get("nameRu") or film.get("nameOriginal") or ""
+
+            if not name:
+                continue
+
+            if is_new_year:
+                if not film_has_poster(film):
+                    continue
+
+                if get_film_rating_value(film) < 5.0:
+                    continue
+
+            collected.append(film)
+
+        if len(collected) >= offset + limit + 10:
+            break
+
+    KP_YEAR_CACHE[cache_key] = {
+        "time": now,
+        "films": collected
+    }
+
+    return collected[offset:offset + limit], None
+
+
+def format_kinopoisk_film(film, index=None, source_text="Из топа Кинопоиска"):
     name = film.get("nameRu") or film.get("nameOriginal") or "Без названия"
     year = film.get("year") or "—"
     rating = film.get("rating") or film.get("ratingKinopoisk") or "—"
@@ -834,6 +1063,11 @@ def format_kinopoisk_film(film, index=None):
         g.get("genre", "") for g in genres[:3] if g.get("genre")
     ) or "—"
 
+    countries = film.get("countries", []) or []
+    countries_text = ", ".join(
+        c.get("country", "") for c in countries[:3] if c.get("country")
+    ) or "—"
+
     prefix = f"{index}. " if index else ""
     movie_name = f"{name} ({year})"
 
@@ -841,13 +1075,14 @@ def format_kinopoisk_film(film, index=None):
         f"{prefix}🎬 {movie_name}\n"
         f"⭐️ Кинопоиск: {rating}\n"
         f"🎭 Жанр: {genres_text}\n"
-        f"🧾 Из топа Кинопоиска"
+        f"🌍 Страна: {countries_text}\n"
+        f"🧾 {source_text}"
     )
 
     return movie_name, text
 
 
-def send_kinopoisk_top(chat_id, page=1, limit=10):
+def send_kinopoisk_top(chat_id, page=1, limit=5):
     films, error = get_kinopoisk_top_films(page=page, limit=limit)
 
     if error:
@@ -863,6 +1098,75 @@ def send_kinopoisk_top(chat_id, page=1, limit=10):
         full_text = f"{text}\n\n{format_rating_line(movie_name)}"
 
         send_movie_card(chat_id, full_text, movie_name, poster_url)
+
+    save_state()
+    save_ratings()
+
+
+def send_year_top(chat_id, year, offset=0, limit=5):
+    films, error = get_foreign_top_by_year(year, offset=offset, limit=limit)
+
+    if error:
+        bot.send_message(chat_id, error)
+        return
+
+    if not films:
+        if int(year) == 2026:
+            bot.send_message(
+                chat_id,
+                "Пока не нашёл достаточно зарубежных фильмов 2026 с рейтингом и постером.\n\n"
+                "Попробуй позже или выбери 2025.",
+                reply_markup=years_markup()
+            )
+        else:
+            bot.send_message(
+                chat_id,
+                f"Не нашёл ещё зарубежных фильмов за {year}. Попробуй другой год.",
+                reply_markup=years_markup()
+            )
+        return
+
+    start_number = offset + 1
+
+    if int(year) == 2026:
+        header = (
+            "🔥 Зарубежные новинки 2026\n\n"
+            "Показываю фильмы, которые уже появились в базе Кинопоиска, "
+            "имеют рейтинг и постер.\n\n"
+            "Доступность онлайн может отличаться.\n"
+            f"Показываю {start_number}–{offset + len(films)}"
+        )
+    else:
+        header = (
+            f"📅 Топ зарубежных фильмов {year}\n"
+            f"Без российских фильмов\n"
+            f"Показываю {start_number}–{offset + len(films)}"
+        )
+
+    bot.send_message(chat_id, header)
+
+    for i, film in enumerate(films, start=start_number):
+        if int(year) == 2026:
+            source_text = "Зарубежная новинка 2026 из базы Кинопоиска"
+        else:
+            source_text = f"Зарубежный фильм из топа {year}"
+
+        movie_name, text = format_kinopoisk_film(
+            film,
+            index=i,
+            source_text=source_text
+        )
+
+        poster_url = film.get("posterUrlPreview") or film.get("posterUrl")
+        full_text = f"{text}\n\n{format_rating_line(movie_name)}"
+
+        send_movie_card(chat_id, full_text, movie_name, poster_url)
+
+    bot.send_message(
+        chat_id,
+        f"Хочешь ещё фильмы за {year}?",
+        reply_markup=year_more_markup(year, offset + limit)
+    )
 
     save_state()
     save_ratings()
@@ -896,6 +1200,7 @@ def admin_command(message):
         "👑 Админ-команды:\n\n"
         "/admin_stats — статистика бота\n"
         "/admin_top — топ фильмов пользователей\n"
+        "/admin_clear_posters — очистить кэш постеров\n"
         "/myid — узнать свой Telegram ID"
     )
 
@@ -920,6 +1225,20 @@ def admin_top_command(message):
         return
 
     send_long_message(message.chat.id, get_user_top_movies(limit=20))
+
+
+@bot.message_handler(commands=["admin_clear_posters"])
+def admin_clear_posters_command(message):
+    register_user_activity(message=message)
+
+    if not is_admin_message(message):
+        bot.send_message(message.chat.id, "⛔️ У тебя нет доступа к этой команде.")
+        return
+
+    state["poster_cache"] = {}
+    save_state()
+
+    bot.send_message(message.chat.id, "🖼 Кэш постеров очищен.")
 
 
 # =========================
@@ -981,7 +1300,7 @@ def help_command(message):
 def reset_command(message):
     register_user_activity(message=message)
 
-    user_id = str(message.chat.id)
+    user_id = str(message.from_user.id)
     state["seen_movies"][user_id] = []
     save_state()
 
@@ -1007,17 +1326,22 @@ def callback(call):
             return
 
         if data == "menu_movies":
-            bot.answer_callback_query(call.id)
+            bot.answer_callback_query(call.id, "Подбираю фильмы 🎬")
             send_recommendations(chat_id, user_id, "фильмы", mode="movies")
             return
 
         if data == "menu_series":
-            bot.answer_callback_query(call.id)
+            bot.answer_callback_query(call.id, "Подбираю сериалы 📺")
             send_recommendations(chat_id, user_id, "сериалы", mode="series")
             return
 
+        if data == "menu_new_2026":
+            bot.answer_callback_query(call.id, "Ищу новинки 2026 🔥")
+            send_year_top(chat_id, 2026, offset=0, limit=5)
+            return
+
         if data == "menu_random":
-            bot.answer_callback_query(call.id)
+            bot.answer_callback_query(call.id, "Ищу случайный фильм 🎲")
             send_recommendations(chat_id, user_id, "случайный фильм", mode="random")
             return
 
@@ -1026,15 +1350,38 @@ def callback(call):
             bot.send_message(chat_id, "🎭 Выбери жанр:", reply_markup=genres_markup())
             return
 
+        if data == "menu_years":
+            bot.answer_callback_query(call.id)
+            bot.send_message(
+                chat_id,
+                "📅 Выбери год.\n\n"
+                "Я покажу топ-5 зарубежных фильмов этого года без российских фильмов.\n\n"
+                "Для 2026 показываю новинки, которые уже появились в базе с рейтингом и постером.",
+                reply_markup=years_markup()
+            )
+            return
+
+        if data.startswith("year_top:"):
+            _, year, offset = data.split(":", 2)
+            year_int = int(year)
+
+            if year_int == 2026:
+                bot.answer_callback_query(call.id, "Ищу новинки 2026 🔥")
+            else:
+                bot.answer_callback_query(call.id, f"Ищу топ фильмов {year} 📅")
+
+            send_year_top(chat_id, year_int, int(offset), limit=5)
+            return
+
         if data.startswith("genre:"):
             genre = data.split(":", 1)[1]
-            bot.answer_callback_query(call.id)
+            bot.answer_callback_query(call.id, f"Жанр: {genre}")
             send_recommendations(chat_id, user_id, genre, mode="genre")
             return
 
         if data == "menu_kp_top":
-            bot.answer_callback_query(call.id)
-            send_kinopoisk_top(chat_id, page=1, limit=10)
+            bot.answer_callback_query(call.id, "Загружаю топ Кинопоиска 🏆")
+            send_kinopoisk_top(chat_id, page=1, limit=5)
             return
 
         if data == "menu_user_top":
@@ -1075,8 +1422,15 @@ def callback(call):
                 bot.answer_callback_query(call.id, "Фильм не найден. Попробуй сделать новый запрос.")
                 return
 
-            bot.answer_callback_query(call.id)
-            send_recommendations(chat_id, user_id, movie_name, mode="similar")
+            bot.answer_callback_query(call.id, "Ищу похожие фильмы 🎞")
+            bot.send_message(chat_id, f"🎞 Ищу 5 фильмов, похожих на: {movie_name}")
+
+            try:
+                send_recommendations(chat_id, user_id, movie_name, mode="similar")
+            except Exception:
+                logging.exception("Ошибка поиска похожих фильмов")
+                bot.send_message(chat_id, "Не получилось подобрать похожие фильмы. Попробуй ещё раз.")
+
             return
 
         if data.startswith("like:"):
@@ -1130,7 +1484,7 @@ def callback(call):
 def chat(message):
     register_user_activity(message=message)
 
-    user_id = str(message.chat.id)
+    user_id = str(message.from_user.id)
     text = (message.text or "").strip()
 
     if not text:
