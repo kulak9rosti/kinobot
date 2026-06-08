@@ -1048,14 +1048,13 @@ def ask_ai(user_prompt):
 
 Жёсткие правила:
 - отвечай только на русском языке
-- для подборки выдавай строго 5 названий
-- для похожих фильмов выдавай строго 5 названий
-- для случайного фильма выдавай строго 1 название
+- количество кандидатов указано в запросе пользователя
 - не пиши описание, сюжет, рейтинг, жанры или причину выбора
 - не добавляй английское название
 - обязательно указывай точный год выхода
-- каждый фильм начинай с 🎬
-- каждый фильм отделяй пустой строкой
+- каждый фильм или сериал начинай с 🎬
+- каждый вариант отделяй пустой строкой
+- не повторяй варианты внутри одного ответа
 
 Формат строго такой:
 🎬 Название (год)
@@ -1072,28 +1071,38 @@ def ask_ai(user_prompt):
     return response.output_text.strip()
 
 
-def build_prompt(user_id, user_text, mode="search"):
+def build_prompt(user_id, user_text, mode="search", candidate_count=10, extra_excluded=None):
     seen = get_seen(user_id)
     profile = get_profile(user_id)
+    extra_excluded = extra_excluded or []
 
     if mode == "similar":
-        task = f"Подбери строго 5 фильмов, похожих на: {user_text}"
+        task = (
+            f"Подбери {candidate_count} разных фильмов, максимально похожих на: "
+            f"{user_text}."
+        )
     elif mode == "series":
-        task = "Подбери строго 5 сильных сериалов."
+        task = f"Подбери {candidate_count} сильных сериалов."
     elif mode == "random":
-        task = "Подбери строго 1 случайный хороший фильм, который реально стоит посмотреть."
+        task = "Подбери 1 случайный хороший фильм, который реально стоит посмотреть."
     elif mode == "genre":
-        task = f"Подбери строго 5 лучших фильмов в жанре: {user_text}."
+        task = f"Подбери {candidate_count} лучших фильмов в жанре: {user_text}."
     elif mode == "movies":
-        task = "Подбери строго 5 хороших фильмов как умную Netflix-подборку."
+        task = f"Подбери {candidate_count} хороших фильмов как умную Netflix-подборку."
     else:
-        task = f"Запрос пользователя: {user_text}. Подбери строго 5 подходящих фильмов или сериалов."
+        task = (
+            f"Запрос пользователя: {user_text}. "
+            f"Подбери {candidate_count} подходящих фильмов или сериалов."
+        )
 
     return f"""
 {task}
 
 Уже показывали пользователю:
-{seen[-80:]}
+{seen[-100:]}
+
+Уже предложены в текущей попытке, их тоже не повторяй:
+{extra_excluded[-50:]}
 
 Пользователю нравится:
 {profile.get('likes', [])[-30:]}
@@ -1103,80 +1112,132 @@ def build_prompt(user_id, user_text, mode="search"):
 
 Важно:
 - не повторяй уже показанные фильмы
+- не повторяй варианты из текущей попытки
 - не добавляй английские названия
-- не добавляй английский перевод
 - не предлагай то, что пользователь дизлайкнул
-- подборка должна быть полезной, не только из самых очевидных фильмов
+- указывай точный год выхода
+- выдай только названия и годы в требуемом формате
 """
 
 
 def split_recommendation_blocks(answer):
-    blocks = [b.strip() for b in answer.split("\n\n") if b.strip()]
-
-    if len(blocks) <= 1 and "🎬" in answer:
-        raw = re.split(r"(?=🎬)", answer)
-        blocks = [b.strip() for b in raw if b.strip()]
-
-    return blocks
+    raw = re.split(r"(?=🎬)", str(answer))
+    return [
+        block.strip()
+        for block in raw
+        if block.strip() and "🎬" in block
+    ]
 
 
 def send_recommendations(chat_id, user_id, user_text, mode="search"):
+    """
+    Всегда старается отправить нужное количество карточек.
+
+    OpenAI даёт запас кандидатов, а фильмы без точного совпадения
+    в Кинопоиске пропускаются. Если карточек не хватает, выполняется
+    дополнительная попытка с новыми кандидатами.
+    """
     bot.send_chat_action(chat_id, "typing")
 
-    prompt = build_prompt(user_id, user_text, mode)
-    answer = ask_ai(prompt)
+    target_count = 1 if mode == "random" else 5
+    candidate_count = 1 if mode == "random" else 10
+    max_attempts = 1 if mode == "random" else 3
 
-    memory.setdefault(user_id, [])
-    memory[user_id].append({"role": "user", "content": user_text})
-    memory[user_id].append({"role": "assistant", "content": answer})
-    memory[user_id] = memory[user_id][-20:]
+    sent_count = 0
+    attempted_names = []
+    sent_movie_keys = set()
+    all_answers = []
 
-    blocks = split_recommendation_blocks(answer)
+    for attempt in range(max_attempts):
+        if sent_count >= target_count:
+            break
 
-    limit_by_mode = {
-        "random": 1,
-        "movies": 5,
-        "series": 5,
-        "genre": 5,
-        "similar": 5,
-        "search": 5
-    }
+        prompt = build_prompt(
+            user_id=user_id,
+            user_text=user_text,
+            mode=mode,
+            candidate_count=candidate_count,
+            extra_excluded=attempted_names
+        )
 
-    max_movies = limit_by_mode.get(mode, 5)
-    movie_blocks = [block for block in blocks if "🎬" in block][:max_movies]
+        answer = ask_ai(prompt)
+        all_answers.append(answer)
+        blocks = split_recommendation_blocks(answer)
 
-    sent_any = False
-
-    for block in movie_blocks:
-        requested_movie_name = extract_movie_name(block)
-
-        if not requested_movie_name:
-            continue
-
-        kinopoisk_film = find_kinopoisk_film(requested_movie_name)
-
-        if not kinopoisk_film:
+        if not blocks:
             logging.warning(
-                f"Пропускаю фильм без точной карточки Кинопоиска: {requested_movie_name}"
+                "OpenAI не вернул распознаваемые названия, попытка %s",
+                attempt + 1
             )
             continue
 
-        movie_name, text = format_kinopoisk_film(kinopoisk_film)
-        poster_url = (
-            kinopoisk_film.get("posterUrlPreview")
-            or kinopoisk_film.get("posterUrl")
-        )
-        full_text = f"{text}\n\n{format_rating_line(movie_name)}"
+        for block in blocks:
+            if sent_count >= target_count:
+                break
 
-        add_seen(user_id, movie_name)
-        send_movie_card(chat_id, full_text, movie_name, poster_url)
-        sent_any = True
+            requested_movie_name = extract_movie_name(block)
 
-    if not sent_any:
+            if not requested_movie_name:
+                continue
+
+            requested_key = normalize_movie_key(requested_movie_name)
+
+            if requested_key in {
+                normalize_movie_key(name) for name in attempted_names
+            }:
+                continue
+
+            attempted_names.append(requested_movie_name)
+
+            kinopoisk_film = find_kinopoisk_film(requested_movie_name)
+
+            if not kinopoisk_film:
+                logging.warning(
+                    "Пропускаю фильм без точной карточки Кинопоиска: %s",
+                    requested_movie_name
+                )
+                continue
+
+            movie_name, text = format_kinopoisk_film(kinopoisk_film)
+            movie_key = normalize_movie_key(movie_name)
+
+            if movie_key in sent_movie_keys:
+                continue
+
+            poster_url = (
+                kinopoisk_film.get("posterUrlPreview")
+                or kinopoisk_film.get("posterUrl")
+            )
+            full_text = f"{text}\n\n{format_rating_line(movie_name)}"
+
+            add_seen(user_id, movie_name)
+            send_movie_card(chat_id, full_text, movie_name, poster_url)
+
+            sent_movie_keys.add(movie_key)
+            sent_count += 1
+
+        if sent_count < target_count and attempt < max_attempts - 1:
+            bot.send_chat_action(chat_id, "typing")
+
+    memory.setdefault(user_id, [])
+    memory[user_id].append({"role": "user", "content": user_text})
+    memory[user_id].append({
+        "role": "assistant",
+        "content": "\n\n".join(all_answers)
+    })
+    memory[user_id] = memory[user_id][-20:]
+
+    if sent_count == 0:
         bot.send_message(
             chat_id,
             "Не удалось найти точные карточки фильмов в Кинопоиске. "
             "Попробуй немного изменить запрос."
+        )
+    elif sent_count < target_count:
+        bot.send_message(
+            chat_id,
+            f"Нашёл только {sent_count} точных вариантов в Кинопоиске. "
+            "Остальные кандидаты не прошли проверку названия и года."
         )
 
     save_memory()
