@@ -286,7 +286,48 @@ def get_kinopoisk_id(film):
     )
 
 
+def get_kinopoisk_details(kinopoisk_id):
+    """
+    Загружает полную карточку фильма из Кинопоиска и кеширует её.
+    В старых версиях в film_detail_cache могли храниться строки описаний —
+    такие записи игнорируются и заменяются полной карточкой.
+    """
+    if not kinopoisk_id or not KINOPOISK_API_KEY:
+        return None
+
+    cache_key = str(kinopoisk_id)
+    cached = state.get("film_detail_cache", {}).get(cache_key)
+
+    if isinstance(cached, dict):
+        return cached
+
+    url = f"https://kinopoiskapiunofficial.tech/api/v2.2/films/{kinopoisk_id}"
+    headers = {
+        "X-API-KEY": KINOPOISK_API_KEY,
+        "Content-Type": "application/json"
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=12)
+        response.raise_for_status()
+        details = response.json()
+    except Exception:
+        logging.exception(f"Не удалось получить карточку фильма {kinopoisk_id}")
+        return None
+
+    state["film_detail_cache"][cache_key] = details
+    save_state()
+    return details
+
+
 def get_film_description(film):
+    """
+    Возвращает только описание из Кинопоиска.
+    Ничего не генерирует и не дописывает самостоятельно.
+    """
+    if not film:
+        return "Описание на Кинопоиске отсутствует."
+
     description = (
         film.get("shortDescription")
         or film.get("description")
@@ -294,46 +335,22 @@ def get_film_description(film):
     )
 
     if description:
-        return shorten_text(description)
+        return shorten_text(description, limit=320)
 
     kinopoisk_id = get_kinopoisk_id(film)
+    details = get_kinopoisk_details(kinopoisk_id)
 
-    if not kinopoisk_id or not KINOPOISK_API_KEY:
-        return "Описание пока не найдено."
+    if details:
+        description = (
+            details.get("shortDescription")
+            or details.get("description")
+            or ""
+        )
 
-    cache_key = str(kinopoisk_id)
+        if description:
+            return shorten_text(description, limit=320)
 
-    cached = state.get("film_detail_cache", {}).get(cache_key)
-    if cached:
-        return cached
-
-    url = f"https://kinopoiskapiunofficial.tech/api/v2.2/films/{kinopoisk_id}"
-
-    headers = {
-        "X-API-KEY": KINOPOISK_API_KEY,
-        "Content-Type": "application/json"
-    }
-
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-    except Exception:
-        logging.exception(f"Не удалось получить описание фильма {kinopoisk_id}")
-        return "Описание пока не найдено."
-
-    description = (
-        data.get("shortDescription")
-        or data.get("description")
-        or ""
-    )
-
-    description = shorten_text(description) or "Описание пока не найдено."
-
-    state["film_detail_cache"][cache_key] = description
-    save_state()
-
-    return description
+    return "Описание на Кинопоиске отсутствует."
 
 
 # =========================
@@ -602,6 +619,74 @@ def title_similarity_score(search_title, film):
             score = max(score, 30)
 
     return score
+
+
+def find_kinopoisk_film(movie_name):
+    """
+    Ищет точный фильм по русскому названию и году,
+    затем возвращает полную карточку Кинопоиска.
+    """
+    if not KINOPOISK_API_KEY:
+        return None
+
+    search_title = clean_title_for_search(movie_name)
+    search_year = extract_year_from_title(movie_name)
+
+    if not search_title:
+        return None
+
+    url = "https://kinopoiskapiunofficial.tech/api/v2.1/films/search-by-keyword"
+    headers = {
+        "X-API-KEY": KINOPOISK_API_KEY,
+        "Content-Type": "application/json"
+    }
+
+    try:
+        response = requests.get(
+            url,
+            headers=headers,
+            params={"keyword": search_title, "page": 1},
+            timeout=12
+        )
+        response.raise_for_status()
+        films = response.json().get("films", [])
+    except Exception:
+        logging.exception(f"Ошибка поиска фильма в Кинопоиске: {movie_name}")
+        return None
+
+    candidates = []
+
+    for film in films:
+        score = title_similarity_score(search_title, film)
+        film_year = str(film.get("year") or "")
+
+        if search_year and film_year == search_year:
+            score += 100
+        elif search_year and film_year and film_year != search_year:
+            score -= 60
+
+        film_type = str(film.get("type") or "").lower()
+        if "film" in film_type or "фильм" in film_type:
+            score += 10
+        elif "series" in film_type or "serial" in film_type:
+            score -= 25
+
+        candidates.append((score, film))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    best_score, best_film = candidates[0]
+
+    # Лучше пропустить фильм, чем показать карточку другого фильма.
+    if best_score < 80:
+        logging.warning(
+            f"Нет точного совпадения Кинопоиска для {movie_name}: score={best_score}"
+        )
+        return None
+
+    return get_kinopoisk_details(get_kinopoisk_id(best_film))
 
 
 def find_kinopoisk_poster(movie_name):
@@ -959,27 +1044,21 @@ def movie_markup(movie_name):
 
 def ask_ai(user_prompt):
     system_prompt = """
-Ты KinoBot AI — Telegram-бот для подбора фильмов и сериалов.
-Отвечай на русском языке.
+Ты выбираешь фильмы и сериалы для Telegram-бота.
 
 Жёсткие правила:
-- если просят подборку, выдавай строго 5 фильмов, не больше
-- если просят похожие фильмы, выдавай строго 5 фильмов, не больше
-- если просят случайный фильм, выдавай строго 1 фильм
-- не добавляй английский перевод названия фильма
-- не пиши название в формате "русское / английское"
-- показывай только русское название и год
-- если русского названия не знаешь, напиши наиболее известное название на русском
-- не повторяй фильмы из списка уже показанных
-- учитывай лайки и дизлайки пользователя
-- не делай длинных вступлений
+- отвечай только на русском языке
+- для подборки выдавай строго 5 названий
+- для похожих фильмов выдавай строго 5 названий
+- для случайного фильма выдавай строго 1 название
+- не пиши описание, сюжет, рейтинг, жанры или причину выбора
+- не добавляй английское название
+- обязательно указывай точный год выхода
+- каждый фильм начинай с 🎬
 - каждый фильм отделяй пустой строкой
 
-Формат каждого фильма строго такой:
+Формат строго такой:
 🎬 Название (год)
-⭐️ Рейтинг: примерный рейтинг или "—"
-🎭 Жанр: 1-3 жанра
-🧾 Почему стоит посмотреть: коротко и по делу
 """
 
     response = client.responses.create(
@@ -1064,27 +1143,41 @@ def send_recommendations(chat_id, user_id, user_text, mode="search"):
     }
 
     max_movies = limit_by_mode.get(mode, 5)
-
-    movie_blocks = [
-        block for block in blocks
-        if "🎬" in block
-    ][:max_movies]
+    movie_blocks = [block for block in blocks if "🎬" in block][:max_movies]
 
     sent_any = False
 
     for block in movie_blocks:
-        movie_name = extract_movie_name(block)
+        requested_movie_name = extract_movie_name(block)
+
+        if not requested_movie_name:
+            continue
+
+        kinopoisk_film = find_kinopoisk_film(requested_movie_name)
+
+        if not kinopoisk_film:
+            logging.warning(
+                f"Пропускаю фильм без точной карточки Кинопоиска: {requested_movie_name}"
+            )
+            continue
+
+        movie_name, text = format_kinopoisk_film(kinopoisk_film)
+        poster_url = (
+            kinopoisk_film.get("posterUrlPreview")
+            or kinopoisk_film.get("posterUrl")
+        )
+        full_text = f"{text}\n\n{format_rating_line(movie_name)}"
+
         add_seen(user_id, movie_name)
-
-        block_with_rating = f"{block}\n\n{format_rating_line(movie_name)}"
-
-        poster_url = find_kinopoisk_poster(movie_name)
-        send_movie_card(chat_id, block_with_rating, movie_name, poster_url)
-
+        send_movie_card(chat_id, full_text, movie_name, poster_url)
         sent_any = True
 
     if not sent_any:
-        send_long_message(chat_id, answer)
+        bot.send_message(
+            chat_id,
+            "Не удалось найти точные карточки фильмов в Кинопоиске. "
+            "Попробуй немного изменить запрос."
+        )
 
     save_memory()
     save_state()
@@ -1158,36 +1251,40 @@ def get_kinopoisk_top_films(page=1, limit=5):
 
 def get_top_by_year(category, year, offset=0, limit=5):
     if not KINOPOISK_API_KEY:
-        return None, "Не найден KINOPOISK_API_KEY. Добавь его в Render → Environment."
+        return None, "Не найден KINOPOISK_API_KEY."
 
     category = str(category)
     year = int(year)
     offset = int(offset)
-
-    now = time.time()
+    required_count = offset + limit
     cache_key = f"{category}:{year}"
 
-    cached = KP_YEAR_CACHE.get(cache_key)
-    if cached and now - cached["time"] < KP_CACHE_TTL_SECONDS:
-        films = cached["films"]
-        return films[offset:offset + limit], None
+    cache = KP_YEAR_CACHE.setdefault(cache_key, {
+        "time": time.time(),
+        "films": [],
+        "next_page": 1,
+        "finished": False,
+        "ids": []
+    })
+
+    # Совместимость со старой структурой кэша.
+    cache.setdefault("films", [])
+    cache.setdefault("next_page", 1)
+    cache.setdefault("finished", False)
+    cache.setdefault("ids", [])
 
     url = "https://kinopoiskapiunofficial.tech/api/v2.2/films"
-
     headers = {
         "X-API-KEY": KINOPOISK_API_KEY,
         "Content-Type": "application/json"
     }
 
-    collected = []
-
     is_new_year = year == 2026
-    max_pages = 15 if is_new_year else 8
-
-    # Для 2026 не требуем рейтинг, потому что у новых фильмов его часто ещё нет.
     min_rating = 0 if is_new_year else 6.0
 
-    for page in range(1, max_pages + 1):
+    while len(cache["films"]) < required_count and not cache["finished"]:
+        page = int(cache["next_page"])
+
         params = {
             "order": "RATING",
             "type": "FILM",
@@ -1199,20 +1296,30 @@ def get_top_by_year(category, year, offset=0, limit=5):
         }
 
         try:
-            response = requests.get(url, headers=headers, params=params, timeout=15)
+            response = requests.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=15
+            )
             response.raise_for_status()
             data = response.json()
-        except requests.exceptions.HTTPError as e:
-            status = getattr(e.response, "status_code", "?")
-            logging.exception("Kinopoisk year top HTTP error")
-            return None, f"Кинопоиск вернул ошибку {status}. Проверь API-ключ или лимиты."
+        except requests.exceptions.HTTPError as error:
+            status = getattr(error.response, "status_code", "?")
+            logging.exception(
+                f"Ошибка Кинопоиска для {year}, страница {page}"
+            )
+            return None, f"Кинопоиск вернул ошибку {status}."
         except Exception:
-            logging.exception("Kinopoisk year top error")
-            return None, "Не получилось получить топ по году. Попробуй позже."
+            logging.exception(
+                f"Ошибка загрузки фильмов {year}, страница {page}"
+            )
+            return None, "Не получилось получить фильмы. Попробуй позже."
 
         items = data.get("items", []) or data.get("films", [])
 
         if not items:
+            cache["finished"] = True
             break
 
         for film in items:
@@ -1223,31 +1330,41 @@ def get_top_by_year(category, year, offset=0, limit=5):
                 continue
 
             name = film.get("nameRu") or film.get("nameOriginal") or ""
-
             if not name:
                 continue
 
-            if is_new_year:
-                if not film_has_poster(film):
-                    continue
+            if is_new_year and not film_has_poster(film):
+                continue
 
-            collected.append(film)
+            film_id = get_kinopoisk_id(film)
+            unique_key = str(film_id or f"{name}:{film.get('year')}")
 
-        if len(collected) >= offset + limit + 10:
-            break
+            if unique_key in cache["ids"]:
+                continue
 
-    KP_YEAR_CACHE[cache_key] = {
-        "time": now,
-        "films": collected
-    }
+            cache["ids"].append(unique_key)
+            cache["films"].append(film)
 
-    return collected[offset:offset + limit], None
+        cache["next_page"] = page + 1
+        cache["time"] = time.time()
+
+        total_pages = data.get("totalPages") or data.get("pagesCount")
+
+        if total_pages and page >= int(total_pages):
+            cache["finished"] = True
+
+        # Защита от бесконечного цикла при некорректном API-ответе.
+        if page >= 100:
+            cache["finished"] = True
+
+    KP_YEAR_CACHE[cache_key] = cache
+    return cache["films"][offset:offset + limit], None
 
 
 def format_kinopoisk_film(film, index=None, source_text=""):
     name = film.get("nameRu") or film.get("nameOriginal") or "Без названия"
     year = film.get("year") or "—"
-    rating = film.get("rating") or film.get("ratingKinopoisk") or "—"
+    rating = film.get("ratingKinopoisk") or film.get("rating") or "—"
 
     genres = film.get("genres", []) or []
     genres_text = ", ".join(
@@ -1285,9 +1402,10 @@ def send_kinopoisk_top(chat_id, page=1, limit=5):
     bot.send_message(chat_id, "🏆 Топ Кинопоиска по рейтингу")
 
     for i, film in enumerate(films, start=1):
-        movie_name, text = format_kinopoisk_film(film, index=i)
+        details = get_kinopoisk_details(get_kinopoisk_id(film)) or film
+        movie_name, text = format_kinopoisk_film(details, index=i)
 
-        poster_url = film.get("posterUrlPreview") or film.get("posterUrl")
+        poster_url = details.get("posterUrlPreview") or details.get("posterUrl")
         full_text = f"{text}\n\n{format_rating_line(movie_name)}"
 
         send_movie_card(chat_id, full_text, movie_name, poster_url)
@@ -1318,12 +1436,13 @@ def send_year_top(chat_id, category, year, offset=0, limit=5):
     start_number = offset + 1
 
     for i, film in enumerate(films, start=start_number):
+        details = get_kinopoisk_details(get_kinopoisk_id(film)) or film
         movie_name, text = format_kinopoisk_film(
-            film,
+            details,
             index=i
         )
 
-        poster_url = film.get("posterUrlPreview") or film.get("posterUrl")
+        poster_url = details.get("posterUrlPreview") or details.get("posterUrl")
         full_text = f"{text}\n\n{format_rating_line(movie_name)}"
 
         send_movie_card(chat_id, full_text, movie_name, poster_url)
@@ -1706,5 +1825,22 @@ def chat(message):
 # START BOT
 # =========================
 
-logging.info("🎬 KinoBot AI запущен")
-bot.infinity_polling(skip_pending=True)
+def run_bot():
+    logging.info("🎬 KinoBot AI запущен")
+
+    while True:
+        try:
+            bot.infinity_polling(
+                skip_pending=True,
+                timeout=30,
+                long_polling_timeout=30
+            )
+        except Exception:
+            logging.exception(
+                "Ошибка соединения. Перезапуск через 5 секунд."
+            )
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    run_bot()
