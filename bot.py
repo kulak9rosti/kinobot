@@ -948,17 +948,39 @@ def menu_markup():
 
     markup.add(
         InlineKeyboardButton("🎬 Фильмы", callback_data="menu_movies"),
-        InlineKeyboardButton("📺 Сериалы", callback_data="menu_series"),
-        InlineKeyboardButton("🔥 Новинки 2026", callback_data="menu_new_2026"),
-        InlineKeyboardButton("🎭 Жанры", callback_data="menu_genres"),
-        InlineKeyboardButton("🌍 Зарубежные по годам", callback_data="menu_years_foreign"),
-        InlineKeyboardButton("🇷🇺 РФ/СНГ + Индия", callback_data="menu_years_cis"),
-        InlineKeyboardButton("🏆 Топ Кинопоиска", callback_data="menu_kp_top"),
-        InlineKeyboardButton("⭐️ Топ пользователей", callback_data="menu_user_top"),
+        InlineKeyboardButton("📺 Сериалы", callback_data="menu_series")
+    )
+
+    markup.add(
+        InlineKeyboardButton("🔥 Новинки", callback_data="menu_new_2026"),
+        InlineKeyboardButton("🎭 Жанры", callback_data="menu_genres")
+    )
+
+    # Эти кнопки делаем широкими, чтобы текст не резался
+    markup.add(
+        InlineKeyboardButton("🌍 Зарубежные по годам", callback_data="menu_years_foreign")
+    )
+
+    markup.add(
+        InlineKeyboardButton("🇷🇺 РФ/СНГ + Индия по годам", callback_data="menu_years_cis")
+    )
+
+    markup.add(
+        InlineKeyboardButton("🏆 Топ КП", callback_data="menu_kp_top"),
+        InlineKeyboardButton("⭐️ Топ пользователей", callback_data="menu_user_top")
+    )
+
+    markup.add(
         InlineKeyboardButton("🎲 Случайный", callback_data="menu_random"),
-        InlineKeyboardButton("🧠 Мой вкус", callback_data="menu_profile"),
-        InlineKeyboardButton("💛 Донат", callback_data="menu_donate"),
-        InlineKeyboardButton("♻️ Начать подбор заново", callback_data="menu_reset")
+        InlineKeyboardButton("🧠 Мой вкус", callback_data="menu_profile")
+    )
+
+    markup.add(
+        InlineKeyboardButton("♻️ Сбросить подбор", callback_data="menu_reset")
+    )
+
+    markup.add(
+        InlineKeyboardButton("💛 Поддержать проект", callback_data="menu_donate")
     )
 
     return markup
