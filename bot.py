@@ -23,15 +23,35 @@ logging.basicConfig(
 # ENV
 # =========================
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-KINOPOISK_API_KEY = os.environ.get("KINOPOISK_API_KEY")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+KINOPOISK_API_KEY = os.environ.get("KINOPOISK_API_KEY", "").strip()
 
 ADMIN_IDS = {
     admin_id.strip()
     for admin_id in os.environ.get("ADMIN_IDS", "").split(",")
     if admin_id.strip()
 }
+
+# Ссылка на CloudTips задаётся в Render → Environment → DONATE_URL
+DONATE_URL = os.environ.get("DONATE_URL", "").strip()
+
+# Текст доната задаётся в Render → Environment → DONATE_TEXT
+DONATE_TEXT = os.environ.get(
+    "DONATE_TEXT",
+    "💛 Поддержать MixCinema\n\n"
+    "Если бот оказался полезным, можно поддержать проект любой суммой.\n\n"
+    "Спасибо за поддержку 🤍"
+).strip()
+
+# Готовое объявление для рассылки после починки Кинопоиск API
+BOT_FIXED_ANNOUNCEMENT = (
+    "🎬 Друзья, бот снова работает нормально!\n\n"
+    "В последние дни у части пользователей могли не загружаться постеры и рекомендации — "
+    "мы упёрлись в лимит запросов к Кинопоиск API.\n\n"
+    "Сейчас лимит обновили, всё починили: подборки, постеры и описания снова должны работать стабильно.\n\n"
+    "Спасибо, что пользуетесь ботом 🤍"
+)
 
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -874,7 +894,7 @@ def format_rating_line(movie_name):
     return f"👍 {likes}   👎 {dislikes}"
 
 
-def get_user_top_movies(limit=10):
+def get_user_top_movies(limit=50):
     if not ratings:
         return "🏆 Топ пользователей пока пуст. Поставь лайки фильмам, и рейтинг начнёт собираться."
 
@@ -908,7 +928,7 @@ def get_user_top_movies(limit=10):
         reverse=True
     )
 
-    text = "🏆 Топ фильмов по оценкам пользователей\n\n"
+    text = "🏆 Топ-50 фильмов по оценкам пользователей\n\n"
 
     for i, item in enumerate(items[:limit], start=1):
         text += (
@@ -937,7 +957,23 @@ def menu_markup():
         InlineKeyboardButton("⭐️ Топ пользователей", callback_data="menu_user_top"),
         InlineKeyboardButton("🎲 Случайный", callback_data="menu_random"),
         InlineKeyboardButton("🧠 Мой вкус", callback_data="menu_profile"),
+        InlineKeyboardButton("💛 Донат", callback_data="menu_donate"),
         InlineKeyboardButton("♻️ Начать подбор заново", callback_data="menu_reset")
+    )
+
+    return markup
+
+
+def donate_markup():
+    markup = InlineKeyboardMarkup(row_width=1)
+
+    if DONATE_URL:
+        markup.add(
+            InlineKeyboardButton("💳 Поддержать через CloudTips", url=DONATE_URL)
+        )
+
+    markup.add(
+        InlineKeyboardButton("⬅️ Назад", callback_data="menu_back")
     )
 
     return markup
@@ -1545,7 +1581,9 @@ def admin_command(message):
         message.chat.id,
         "👑 Админ-команды:\n\n"
         "/admin_stats — статистика бота\n"
-        "/admin_top — топ фильмов пользователей\n"
+        "/admin_top — топ-50 фильмов пользователей\n"
+        "/admin_broadcast_fixed — отправить объявление о починке всем пользователям\n"
+        "/admin_broadcast текст — отправить свой текст всем пользователям\n"
         "/admin_clear_posters — очистить кэш постеров\n"
         "/admin_clear_details — очистить кэш описаний\n"
         "/myid — узнать свой Telegram ID"
@@ -1571,7 +1609,91 @@ def admin_top_command(message):
         bot.send_message(message.chat.id, "⛔️ У тебя нет доступа к этой команде.")
         return
 
-    send_long_message(message.chat.id, get_user_top_movies(limit=20))
+    send_long_message(message.chat.id, get_user_top_movies(limit=50))
+
+
+def broadcast_to_all_users(text):
+    users = state.get("stats", {}).get("users", {})
+    chat_ids = set()
+
+    for record in users.values():
+        chat_id = str(record.get("chat_id", "")).strip()
+        if chat_id:
+            chat_ids.add(chat_id)
+
+    sent = 0
+    failed = 0
+
+    for chat_id in chat_ids:
+        try:
+            bot.send_message(
+                chat_id,
+                text,
+                reply_markup=menu_markup()
+            )
+            sent += 1
+            time.sleep(0.05)
+        except Exception:
+            failed += 1
+            logging.exception(f"Не удалось отправить рассылку пользователю {chat_id}")
+
+    return sent, failed
+
+
+@bot.message_handler(commands=["admin_broadcast_fixed"])
+def admin_broadcast_fixed_command(message):
+    register_user_activity(message=message)
+
+    if not is_admin_message(message):
+        bot.send_message(message.chat.id, "⛔️ У тебя нет доступа к этой команде.")
+        return
+
+    bot.send_message(message.chat.id, "📣 Отправляю объявление всем пользователям...")
+
+    sent, failed = broadcast_to_all_users(BOT_FIXED_ANNOUNCEMENT)
+
+    bot.send_message(
+        message.chat.id,
+        f"✅ Готово.\n\n"
+        f"Отправлено: {sent}\n"
+        f"Ошибок: {failed}"
+    )
+
+
+@bot.message_handler(commands=["admin_broadcast"])
+def admin_broadcast_command(message):
+    register_user_activity(message=message)
+
+    if not is_admin_message(message):
+        bot.send_message(message.chat.id, "⛔️ У тебя нет доступа к этой команде.")
+        return
+
+    text = re.sub(
+        r"^/admin_broadcast(@\w+)?\s*",
+        "",
+        message.text or "",
+        flags=re.DOTALL
+    ).strip()
+
+    if not text:
+        bot.send_message(
+            message.chat.id,
+            "Напиши текст рассылки после команды.\n\n"
+            "Пример:\n"
+            "/admin_broadcast 🎬 Друзья, бот снова работает нормально!"
+        )
+        return
+
+    bot.send_message(message.chat.id, "📣 Начинаю рассылку...")
+
+    sent, failed = broadcast_to_all_users(text)
+
+    bot.send_message(
+        message.chat.id,
+        f"✅ Рассылка завершена.\n\n"
+        f"Отправлено: {sent}\n"
+        f"Ошибок: {failed}"
+    )
 
 
 @bot.message_handler(commands=["admin_clear_posters"])
@@ -1766,7 +1888,16 @@ def callback(call):
 
         if data == "menu_user_top":
             bot.answer_callback_query(call.id)
-            send_long_message(chat_id, get_user_top_movies(limit=10))
+            send_long_message(chat_id, get_user_top_movies(limit=50))
+            return
+
+        if data == "menu_donate":
+            bot.answer_callback_query(call.id)
+            bot.send_message(
+                chat_id,
+                DONATE_TEXT,
+                reply_markup=donate_markup()
+            )
             return
 
         if data == "menu_profile":
